@@ -1,88 +1,19 @@
 services:
-  mpx_db:
-    image: postgres:16-alpine
-    container_name: mpx_db
-    environment:
-      POSTGRES_USER: mpx_user
-      POSTGRES_PASSWORD: mpx_password
-      POSTGRES_DB: mpx_marketplace
-    volumes:
-      - mpx_db_data:/var/lib/postgresql/data
-    expose:
-      - "5432"
-    networks:
-      - mpx-market
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mpx_user -d mpx_marketplace"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   core_gateway:
     build:
       context: ./core_gateway
     environment:
       CORE_GATEWAY_HOST: ${CORE_GATEWAY_HOST:-0.0.0.0}
       CORE_GATEWAY_PORT: ${CORE_GATEWAY_PORT:-8080}
+      CORE_GATEWAY_WORKERS: ${CORE_GATEWAY_WORKERS:-1}
+      # Dev AES-256-GCM key (32 bytes / 64 hex chars)
+      MPX_DEV_AES_KEY_HEX: ${MPX_DEV_AES_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000001}
+      # Dev robot UUID (exactly 16 bytes) — matches APP_ROBOT_UUID in robot firmware
+      MPX_DEV_ROBOT_UUID: ${MPX_DEV_ROBOT_UUID:-MPX-DOG-01}
     ports:
       - "8080:8080"
-    networks:
-      - mpx-core
-      - mpx-market
     restart: unless-stopped
     read_only: true
     tmpfs:
       - /tmp
 
-  cognitive_agent:
-    build:
-      context: ./cognitive_agent
-    environment:
-      COGNITIVE_AGENT_HOST: ${COGNITIVE_AGENT_HOST:-0.0.0.0}
-      COGNITIVE_AGENT_PORT: ${COGNITIVE_AGENT_PORT:-8080}
-    expose:
-      - "8080"
-    networks:
-      - mpx-core
-    restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp
-
-  skill_marketplace:
-    build:
-      context: ./skill_marketplace
-    environment:
-      MARKETPLACE_HOST: ${MARKETPLACE_HOST:-0.0.0.0}
-      MARKETPLACE_PORT: ${MARKETPLACE_PORT:-8080}
-      DATABASE_URL: postgresql+asyncpg://mpx_user:mpx_password@mpx_db:5432/mpx_marketplace
-      MARKETPLACE_STORAGE_ROOT: ${MARKETPLACE_STORAGE_ROOT:-/tmp/mpx-marketplace-storage}
-      MARKETPLACE_SIGNING_SECRET: ${MARKETPLACE_SIGNING_SECRET:-change-me}
-    expose:
-      - "8080"
-    volumes:
-      - ./skill_marketplace/storage:${MARKETPLACE_STORAGE_ROOT:-/tmp/mpx-marketplace-storage}:ro
-    networks:
-      - mpx-market
-    depends_on:
-      mpx_db:
-        condition: service_healthy
-    restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp
-    ports:
-      - "8081:8080"
-
-volumes:
-  mpx_db_data:
-    driver: local
-
-networks:
-  mpx-core:
-    driver: bridge
-    # internal: true
-  mpx-market:
-    driver: bridge
-    # internal: true
