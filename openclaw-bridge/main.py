@@ -236,6 +236,49 @@ async def healthz(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Queue — pending reply endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/pending/{robot_uuid}")
+async def pending_reply(request: Request, robot_uuid: str):
+    """Check for a queued reply waiting for this robot.
+
+    Polled by core_gateway when the robot (re)connects.  If the agent
+    replied after the previous connection dropped, this returns the reply
+    so it can be sent on the fresh socket.
+
+    Returns the ChatReply JSON on success, or 404 with
+    ``{"status": "no_reply"}`` if nothing is queued.
+    """
+    cid = _set_cid(request)
+    client = await get_client()
+
+    agent_url = COGNITIVE_AGENT_URL.rstrip("/v1/chat/process").rstrip("/")
+    # Derive the host-listener's pending endpoint from the agent URL
+    pending_url = f"{agent_url}/v1/replies/{robot_uuid}"
+
+    try:
+        resp = await client.get(pending_url, timeout=5.0)
+        if resp.status_code == 200:
+            logger.info(
+                "Queued reply found for %s (pending check) — delivering",
+                robot_uuid,
+            )
+            return JSONResponse(content=resp.json())
+    except httpx.RequestError as exc:
+        logger.debug(
+            "Pending check for %s failed: %s", robot_uuid, exc,
+        )
+
+    logger.debug("No queued reply for %s", robot_uuid)
+    return JSONResponse(
+        status_code=404,
+        content={"status": "no_reply", "robot_uuid": robot_uuid},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main process endpoint
 # ---------------------------------------------------------------------------
 

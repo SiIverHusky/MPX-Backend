@@ -6,7 +6,7 @@ services:
       CORE_GATEWAY_HOST: ${CORE_GATEWAY_HOST:-0.0.0.0}
       CORE_GATEWAY_PORT: ${CORE_GATEWAY_PORT:-8080}
       CORE_GATEWAY_WORKERS: ${CORE_GATEWAY_WORKERS:-1}
-      CORE_GATEWAY_KEEPALIVE_INTERVAL: ${CORE_GATEWAY_KEEPALIVE_INTERVAL:-3.0}
+      CORE_GATEWAY_KEEPALIVE_INTERVAL: ${CORE_GATEWAY_KEEPALIVE_INTERVAL:-30.0}
       # Dev AES-256-GCM key (32 bytes / 64 hex chars)
       MPX_DEV_AES_KEY_HEX: ${MPX_DEV_AES_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000001}
       # Dev robot UUID (exactly 16 bytes) — matches APP_ROBOT_UUID in robot firmware
@@ -33,7 +33,8 @@ services:
       BRIDGE_PORT: "9090"
       # Where to forward processed chat messages.
       # For Docker-to-host access, use host.docker.internal on Docker Desktop;
-      # on Linux, use the host IP or --add-host.
+      # on Linux, set COGNITIVE_AGENT_URL to the host LAN IP, e.g.:
+      #   COGNITIVE_AGENT_URL=http://10.170.0.3:19090/v1/chat/process
       COGNITIVE_AGENT_URL: ${COGNITIVE_AGENT_URL:-http://host.docker.internal:19090/v1/chat/process}
       BRIDGE_TIMEOUT: "30.0"
       BRIDGE_MAX_RETRIES: "2"

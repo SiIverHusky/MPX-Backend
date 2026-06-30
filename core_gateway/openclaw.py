@@ -126,3 +126,47 @@ async def openclaw_process(msg: dict[str, Any], robot_uuid: str) -> str:
         openclaw_settings.max_retries + 1,
     )
     return FALLBACK_REPLY
+
+
+# ---------------------------------------------------------------------------
+# Queued reply check (for robot reconnect)
+# ---------------------------------------------------------------------------
+# When a robot reconnects, we check if there's a queued reply waiting
+# from a previous disconnect.  The bridge proxies this to the host-listener.
+
+
+async def check_queued_reply(robot_uuid: str) -> dict[str, Any] | None:
+    """Check if there's a queued reply for *robot_uuid* on the host-listener.
+
+    Returns the reply dict if one is available, or ``None`` if no reply
+    is queued or the upstream is unreachable.
+
+    This is called by ``_handle_ingress`` on robot (re)connect so that
+    any reply that was generated while the robot was offline is delivered
+    immediately without requiring a new chat message.
+    """
+    client = await get_client()
+    try:
+        resp = await client.get(
+            f"/v1/replies/{robot_uuid}",
+            timeout=5.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info("Found queued reply for %s — will deliver on reconnect", robot_uuid)
+            return data
+        elif resp.status_code == 404:
+            return None
+        else:
+            logger.debug(
+                "Reply check for %s returned HTTP %d",
+                robot_uuid,
+                resp.status_code,
+            )
+            return None
+    except httpx.TimeoutException:
+        logger.debug("Reply check timeout for %s (upstream may be down)", robot_uuid)
+        return None
+    except httpx.RequestError as exc:
+        logger.debug("Reply check error for %s: %s", robot_uuid, exc)
+        return None

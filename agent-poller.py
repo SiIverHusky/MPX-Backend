@@ -47,27 +47,54 @@ def check():
 
 
 def reply(msg_id: str, reply_body: dict):
-    """Submit a reply for a pending message."""
+    """Submit a reply for a pending message.
+
+    Automatically fetches the pending message to get the robot_uuid
+    for queue support (in case the robot disconnected).
+    """
+    # Fetch the pending message to get robot_uuid
+    robot_uuid = ""
+    try:
+        req = urllib.request.Request(f"{BASE_URL}/v1/messages/pending")
+        with urllib.request.urlopen(req) as r:
+            pending_list = json.loads(r.read())
+        for m in pending_list:
+            if m["msg_id"] == msg_id:
+                robot_uuid = m.get("robot_uuid", "")
+                # Strip null padding if present
+                robot_uuid = robot_uuid.rstrip("\x00")
+                break
+    except Exception:
+        pass
+
     # Build complete ChatReply JSON
+    import time
     chat_reply = {
         "type": "chat_reply",
-        "ts": int(__import__("time").time()),
+        "ts": int(time.time()),
         "actions": reply_body.get("actions", [{"gait": "none", "param": 0}]),
         "commands": reply_body.get("commands", []),
         "text": reply_body.get("text", ""),
     }
 
+    # Include robot_uuid so host-listener can queue the reply
     payload = json.dumps(chat_reply).encode()
     req = urllib.request.Request(
         f"{BASE_URL}/v1/messages/{msg_id}/reply",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-Robot-UUID": robot_uuid,
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req) as r:
             resp = json.loads(r.read())
-            print(f"Reply submitted: {json.dumps(resp)}")
+            if robot_uuid:
+                print(f"Reply submitted (queued for {robot_uuid}): {json.dumps(resp)}")
+            else:
+                print(f"Reply submitted: {json.dumps(resp)}")
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

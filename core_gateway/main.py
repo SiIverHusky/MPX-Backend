@@ -5,6 +5,7 @@ import logging
 import asyncio
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
@@ -94,6 +95,15 @@ async def _handle_ingress(socket: WebSocket) -> None:
 
             logger.info("Robot %s connected", robot_uuid_str)
 
+            # ── Check for queued reply from previous session ─────
+            queued_reply = await _check_pending_reply(robot_uuid_str, key, robot_uuid, socket)
+            if queued_reply is not None:
+                # Queued reply was sent to the robot — proceed normally
+                logger.info(
+                    "Delivered queued reply to %s, awaiting next message",
+                    robot_uuid_str,
+                )
+
             # ── Start keep-alive background task ─────────────────
             async def _keepalive():
                 """Send an encrypted empty frame every 3 s to keep
@@ -151,6 +161,45 @@ async def chat_ingress_root(socket: WebSocket) -> None:
 @app.websocket("/v1/chat/ingress")
 async def chat_ingress(socket: WebSocket) -> None:
     await _handle_ingress(socket)
+
+
+async def _check_pending_reply(
+    robot_uuid_str: str,
+    key: bytes,
+    robot_uuid: bytes,
+    socket: WebSocket,
+) -> dict | None:
+    """Check the bridge for a queued reply from a previous session.
+
+    Returns the reply dict if one was found and sent, None otherwise.
+    """
+    try:
+        from config import openclaw_settings
+        base = openclaw_settings.base_url.rstrip("/")
+        url = f"{base}/v1/pending/{robot_uuid_str}"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                reply_data = resp.json()
+                if isinstance(reply_data, dict) and "type" in reply_data:
+                    import os
+                    fresh_iv = os.urandom(12)
+                    reply_json = json.dumps(reply_data)
+                    frame = build_downstream_frame_with_iv(
+                        robot_uuid, key, fresh_iv, reply_json.encode(),
+                    )
+                    await socket.send_bytes(frame)
+                    logger.info(
+                        "Sent queued reply to %s: %.80s",
+                        robot_uuid_str,
+                        reply_data.get("text", "")[:80],
+                    )
+                    return reply_data
+    except (httpx.RequestError, Exception) as exc:
+        logger.debug(
+            "Pending reply check for %s: %s", robot_uuid_str, exc,
+        )
+    return None
 
 
 async def _process_chat_frame(
