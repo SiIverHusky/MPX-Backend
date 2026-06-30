@@ -11,13 +11,34 @@ services:
       MPX_DEV_AES_KEY_HEX: ${MPX_DEV_AES_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000001}
       # Dev robot UUID (exactly 16 bytes) — matches APP_ROBOT_UUID in robot firmware
       MPX_DEV_ROBOT_UUID: ${MPX_DEV_ROBOT_UUID:-MPX-DOG-01}
-      # OpenClaw autonomous agent connection
-      OPENCLAW_BASE_URL: ${OPENCLAW_BASE_URL:-http://openclaw:9090}
+      # OpenClaw autonomous agent connection → routed via openclaw-bridge
+      OPENCLAW_BASE_URL: ${OPENCLAW_BASE_URL:-http://openclaw-bridge:9090}
       OPENCLAW_API_KEY: ${OPENCLAW_API_KEY:-}
       OPENCLAW_TIMEOUT: ${OPENCLAW_TIMEOUT:-15.0}
       OPENCLAW_MAX_RETRIES: ${OPENCLAW_MAX_RETRIES:-2}
     ports:
       - "8080:8080"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      - openclaw-bridge
+
+  openclaw-bridge:
+    build:
+      context: ./openclaw-bridge
+    environment:
+      BRIDGE_HOST: "0.0.0.0"
+      BRIDGE_PORT: "9090"
+      # Where to forward processed chat messages.
+      # For Docker-to-host access, use host.docker.internal on Docker Desktop;
+      # on Linux, use the host IP or --add-host.
+      COGNITIVE_AGENT_URL: ${COGNITIVE_AGENT_URL:-http://host.docker.internal:19090/v1/chat/process}
+      BRIDGE_TIMEOUT: "30.0"
+      BRIDGE_MAX_RETRIES: "2"
+    ports:
+      - "9090:9090"
     restart: unless-stopped
     read_only: true
     tmpfs:

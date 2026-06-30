@@ -49,9 +49,12 @@ async def healthz() -> JSONResponse:
 # ===========================================================================
 # WebSocket — Encrypted Binary Frame Ingress
 # ===========================================================================
+# Shared WebSocket handler — both / and /v1/chat/ingress point here
+# because the ESP32 firmware connects to the root path by default.
+# ===========================================================================
 
-@app.websocket("/v1/chat/ingress")
-async def chat_ingress(socket: WebSocket) -> None:
+
+async def _handle_ingress(socket: WebSocket) -> None:
     """Encrypted binary-frame chat ingress for MPX robots.
 
     Protocol (Comm.md §2–§6):
@@ -135,6 +138,19 @@ async def chat_ingress(socket: WebSocket) -> None:
     finally:
         if _keepalive_task is not None:
             _keepalive_task.cancel()
+
+
+# Both paths handled by the same logic — the ESP32 firmware may
+# connect to "/" (default) or "/v1/chat/ingress".
+
+@app.websocket("/")
+async def chat_ingress_root(socket: WebSocket) -> None:
+    await _handle_ingress(socket)
+
+
+@app.websocket("/v1/chat/ingress")
+async def chat_ingress(socket: WebSocket) -> None:
+    await _handle_ingress(socket)
 
 
 async def _process_chat_frame(

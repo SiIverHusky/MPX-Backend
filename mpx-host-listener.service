@@ -1,0 +1,16 @@
+[Unit]
+Description=MPX Bridge Host Listener — connects Docker core_gateway to OpenClaw agent
+After=network.target
+
+[Service]
+Type=simple
+User=mangdang
+WorkingDirectory=/home/mangdang/mpx-server
+ExecStart=/usr/bin/python3 /home/mangdang/mpx-server/host-listener.py \
+    --port 19090 \
+    --data-dir /tmp/mpx-bridge-data
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
