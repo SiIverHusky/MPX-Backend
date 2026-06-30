@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from crypto import build_downstream_frame, decrypt_frame, lookup_key_by_uuid
+from crypto import build_downstream_frame, build_downstream_frame_with_iv, decrypt_frame, lookup_key_by_uuid
 from config import settings
+from openclaw import openclaw_process, shutdown_client
 from protocol.packets import ChatReply, GaitAction
 
 # ---------------------------------------------------------------------------
@@ -28,7 +30,8 @@ async def lifespan(app: FastAPI):
     """Application lifespan."""
     logger.info("Starting MPX Chat Ingress Gateway (protocol v1.0)")
     yield
-    logger.info("Core gateway shut down")
+    logger.info("Shutting down core gateway...")
+    await shutdown_client()
 
 
 app = FastAPI(title="MPX Chat Ingress Gateway", version="2.0.0", lifespan=lifespan)
@@ -77,7 +80,7 @@ async def chat_ingress(socket: WebSocket) -> None:
                 await socket.close(code=1008, reason="Auth failure")
                 return
 
-            robot_uuid, plaintext = result
+            robot_uuid, iv, plaintext = result
             robot_uuid_str = robot_uuid.decode("utf-8", errors="replace")
 
             key = lookup_key_by_uuid(robot_uuid)
@@ -93,10 +96,12 @@ async def chat_ingress(socket: WebSocket) -> None:
                 """Send an encrypted empty frame every 3 s to keep
                 the ESP32's recv() from timing out."""
                 ka_payload = ChatReply(
-                    text="", actions=[GaitAction(gait="none", param=0)],
+                    text="",
+                    actions=[GaitAction(gait="none", param=0)],
+                    commands=[],
                 ).model_dump_json().encode("utf-8")
                 while True:
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(settings.keepalive_interval)
                     try:
                         frame = build_downstream_frame(robot_uuid, key, ka_payload)
                         await socket.send_bytes(frame)
@@ -106,15 +111,15 @@ async def chat_ingress(socket: WebSocket) -> None:
             _keepalive_task = asyncio.create_task(_keepalive())
 
             # ── Process the first message ────────────────────────
-            await _process_chat_frame(socket, robot_uuid, robot_uuid_str, key, plaintext)
+            await _process_chat_frame(socket, robot_uuid, robot_uuid_str, key, iv, plaintext)
 
             # ── Continue receiving subsequent frames ─────────────
             async for message in socket.iter_bytes():
                 result = decrypt_frame(message)
                 if result is None:
                     continue
-                _, plaintext = result
-                await _process_chat_frame(socket, robot_uuid, robot_uuid_str, key, plaintext)
+                _, iv, plaintext = result
+                await _process_chat_frame(socket, robot_uuid, robot_uuid_str, key, iv, plaintext)
 
             # If we exit the for-loop the connection was closed
             break
@@ -137,17 +142,29 @@ async def _process_chat_frame(
     robot_uuid: bytes,
     robot_uuid_str: str,
     key: bytes,
+    iv: bytes,
     plaintext: bytes,
 ) -> None:
-    """Decode, persist, echo, and encrypt-reply to one chat frame."""
+    """Decrypt, route to OpenClaw, encrypt reply, and send."""
     try:
         data = json.loads(plaintext)
     except json.JSONDecodeError:
         logger.warning("Non-JSON plaintext from %s", robot_uuid_str)
         return
 
-    if data.get("type") != "user_chat_input":
-        logger.debug("Ignoring non-chat frame type=%s", data.get("type"))
+    msg_type = data.get("type")
+
+    # ── session_reset: forward to OpenClaw, discard context ──────
+    if msg_type == "session_reset":
+        logger.info("Session reset for %s", robot_uuid_str)
+        reply_json = await openclaw_process(data, robot_uuid_str)
+        frame = build_downstream_frame_with_iv(robot_uuid, key, iv, reply_json.encode("utf-8"))
+        await socket.send_bytes(frame)
+        return
+
+    # ── Only handle user_chat_input ──────────────────────────────
+    if msg_type != "user_chat_input":
+        logger.debug("Ignoring non-chat frame type=%s", msg_type)
         return
 
     user_text = data.get("text", "").strip()
@@ -156,16 +173,10 @@ async def _process_chat_frame(
 
     logger.info("Chat from %s: %.120s", robot_uuid_str, user_text)
 
-    # ── Echo reply (cognitive agent not yet available) ──────────
-    reply_text = f"Echo from server: you said '{user_text}'"
+    # ── Call OpenClaw agent ──────────────────────────────────────
+    reply_json = await openclaw_process(data, robot_uuid_str)
 
-    downstream = ChatReply(
-        text=reply_text,
-        actions=[GaitAction(gait="none", param=0)],
-    )
-    downstream_bytes = downstream.model_dump_json().encode("utf-8")
-
-    # ── Encrypt and send reply ──────────────────────────────────
-    frame = build_downstream_frame(robot_uuid, key, downstream_bytes)
+    # ── Encrypt and send reply (reusing upstream IV per spec) ────
+    frame = build_downstream_frame_with_iv(robot_uuid, key, iv, reply_json.encode("utf-8"))
     await socket.send_bytes(frame)
-    logger.info("Replied to %s: %.120s", robot_uuid_str, reply_text)
+    logger.info("Replied to %s: %.120s", robot_uuid_str, json.loads(reply_json).get("text", "")[:120])

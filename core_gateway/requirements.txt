@@ -4,3 +4,4 @@ pydantic==2.10.6
 uvloop==0.21.0
 httptools==0.6.4
 cryptography==44.0.0
+httpx==0.28.1

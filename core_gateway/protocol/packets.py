@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -33,6 +33,20 @@ class UserChatInput(BaseModel):
     text: str = Field(min_length=1, max_length=4096)
 
 
+class SessionReset(BaseModel):
+    """Sent by the PWA when the user starts a 'New Conversation'.
+
+    The ingress must forward this to OpenClaw to discard conversation
+    context for this robot.
+    """
+
+    type: Literal["session_reset"] = "session_reset"
+    ts: int = 0
+
+
+UpstreamMessage = Union[UserChatInput, SessionReset]
+
+
 # =========================================================================
 # Downstream (Server → Robot) — JSON inside ciphertext
 # =========================================================================
@@ -47,12 +61,30 @@ class GaitAction(BaseModel):
     param: int = 0
 
 
+class LuaCommand(BaseModel):
+    """A single Lua command for the robot to execute sequentially.
+
+    New preferred format (CLOUD_INGRESS.md §4.3). Each script gets
+    a 5-second timeout on the robot.
+    """
+
+    type: Literal["lua"] = "lua"
+    script: str = Field(..., min_length=1, max_length=4096)
+
+
+Command = Union[LuaCommand]
+
+
 class ChatReply(BaseModel):
     """Chat response sent back to the robot.
 
-    Matches the downstream payload schema in Comm.md §5.2.
+    Matches the downstream payload schema in Comm.md §5.2 and
+    CLOUD_INGRESS.md §4.2.  The ``commands`` field is the new
+    preferred format; ``actions`` is kept for backward compatibility
+    with older firmware.
     """
 
     type: Literal["chat_reply"] = "chat_reply"
     text: str = Field(default="", max_length=4096)
     actions: list[GaitAction] = Field(default_factory=lambda: [GaitAction()])
+    commands: list[Command] = Field(default_factory=list)
