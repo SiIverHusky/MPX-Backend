@@ -31,6 +31,10 @@ from fastapi.responses import JSONResponse
 # ---------------------------------------------------------------------------
 # Logging — correlation ID via ContextVar
 # ---------------------------------------------------------------------------
+# NOTE: we do NOT use logging.basicConfig() here because that sets the format
+# on the root handler, which breaks other loggers (httpx, uvicorn, …) that
+# don't have the ``correlation_id`` field in their records.  Instead we
+# create a dedicated handler for *our* logger only.
 _cid_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("correlation_id", default="-")
 
 
@@ -42,12 +46,21 @@ class CorrelationIDFilter(logging.Filter):
         return True
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s openclaw-bridge [%(correlation_id)s] %(message)s",
-)
+_handler = logging.StreamHandler()
+_handler.setLevel(logging.INFO)
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)s openclaw-bridge [%(correlation_id)s] %(message)s",
+))
+
 logger = logging.getLogger("openclaw-bridge")
+logger.setLevel(logging.INFO)
+logger.addHandler(_handler)
 logger.addFilter(CorrelationIDFilter())
+logger.propagate = False  # don't duplicate to root handler
+
+# Suppress noisy httpx request/response logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _set_cid(request: Request | None = None) -> str:

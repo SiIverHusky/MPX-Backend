@@ -14,7 +14,7 @@ services:
       # OpenClaw autonomous agent connection → routed via openclaw-bridge
       OPENCLAW_BASE_URL: ${OPENCLAW_BASE_URL:-http://openclaw-bridge:9090}
       OPENCLAW_API_KEY: ${OPENCLAW_API_KEY:-}
-      OPENCLAW_TIMEOUT: ${OPENCLAW_TIMEOUT:-15.0}
+      OPENCLAW_TIMEOUT: ${OPENCLAW_TIMEOUT:-180.0}
       OPENCLAW_MAX_RETRIES: ${OPENCLAW_MAX_RETRIES:-2}
     ports:
       - "8080:8080"
