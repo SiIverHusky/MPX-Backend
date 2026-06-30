@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py ./
 COPY config.py ./
 COPY crypto.py ./
+COPY openclaw.py ./
 COPY protocol ./protocol
 COPY entrypoint.sh ./
 RUN chmod +x ./entrypoint.sh
