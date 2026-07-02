@@ -6,14 +6,16 @@ Usage:
   # Check for pending messages
   python3 agent-poller.py check
 
-  # Reply to a specific message
+  # Reply to a specific message (use commands format with Lua scripts)
   python3 agent-poller.py reply <msg_id> <reply_json>
 
-  # Simple example: reply with text + action
-  python3 agent-poller.py reply <msg_id> '{"text":"Hello!","actions":[{"gait":"wag","param":1}]}'
+  # Example: reply with Lua command
+  python3 agent-poller.py reply <msg_id> '{"text":"Hello!","commands":[{"type":"lua","script":"robot.gait(\"twerk\")"}]}'
 
   # Full conversation flow: poll and let agent handle via stdin
   python3 agent-poller.py process <msg_id>
+
+Lua command reference: lua-bindings.md
 """
 
 from __future__ import annotations

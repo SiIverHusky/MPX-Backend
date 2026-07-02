@@ -28,6 +28,8 @@ services:
   openclaw-bridge:
     build:
       context: ./openclaw-bridge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       BRIDGE_HOST: "0.0.0.0"
       BRIDGE_PORT: "9090"
