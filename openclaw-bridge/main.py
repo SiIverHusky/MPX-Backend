@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, AsyncGenerator
 from uuid import uuid4
 
 import httpx
@@ -191,7 +191,7 @@ async def lifespan(app: FastAPI):
     await shutdown_client()
 
 
-app = FastAPI(title="OpenClaw Bridge", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="OpenClaw Bridge", version="2.0.0", lifespan=lifespan)
 
 # CORS — permissive for internal use; tighten if exposed externally
 app.add_middleware(
@@ -229,7 +229,7 @@ async def healthz(request: Request):
     return JSONResponse(content={
         "status": "ok",
         "service": "openclaw-bridge",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "agent_url": COGNITIVE_AGENT_URL,
         "agent_reachable": agent_reachable,
     })
@@ -351,6 +351,80 @@ async def chat_process(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Streaming process endpoint (SSE)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/chat/process-stream")
+async def chat_process_stream(request: Request):
+    """Receive a decrypted chat message and stream back step+chat_reply messages
+    via Server-Sent Events (SSE).
+
+    This endpoint is preferred over ``/v1/chat/process`` because it allows
+    OpenClaw to send intermediate ``step`` messages before the final
+    ``chat_reply``, enabling real-time progress in the PWA.
+
+    The response is a SSE stream where each ``data:`` line is a JSON object
+    (``step`` or ``chat_reply``), terminated by ``data: [DONE]``.
+    """
+    cid = _set_cid(request)
+
+    # ── Body-size guard ─────────────────────────────────────────
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_BODY_SIZE:
+                logger.warning("Request body too large: %s bytes", content_length)
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "request body too large"},
+                )
+        except ValueError:
+            pass
+
+    # ── Parse body ──────────────────────────────────────────────
+    try:
+        body = await request.json()
+    except Exception:
+        logger.warning("Invalid JSON from core_gateway")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid JSON"},
+        )
+
+    # ── Validate incoming payload ───────────────────────────────
+    robot_uuid, msg, err = _validate_incoming(body)
+    if err:
+        logger.warning("Validation error: %s", err)
+        return JSONResponse(status_code=422, content={"error": err})
+
+    logger.info(
+        "Streaming from %s: type=%s session=%s text=%.80s",
+        robot_uuid,
+        msg.get("type", "?"),
+        msg.get("session_id", ""),
+        (msg.get("text") or "")[:80],
+    )
+
+    # ── Forward to cognitive agent with streaming ───────────────
+    async def event_stream():
+        async for downstream_msg in _forward_to_agent_stream(body, cid):
+            yield f"data: {json.dumps(downstream_msg)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Correlation-ID": cid,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Forwarding with retry + exponential backoff
 # ---------------------------------------------------------------------------
 
@@ -435,4 +509,75 @@ async def _forward_to_agent(payload: dict, cid: str) -> dict[str, Any]:
     return dict(FALLBACK_REPLY, ts=int(time.time()))
 
 
+# ---------------------------------------------------------------------------
+# Streaming forward — yields step + chat_reply messages
+# ---------------------------------------------------------------------------
 
+
+async def _forward_to_agent_stream(
+    payload: dict,
+    cid: str,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """POST *payload* to the cognitive agent and stream the response.
+
+    Yields dicts representing downstream messages.  Typically zero or more
+    ``step`` messages, then a final ``chat_reply`` message.
+
+    Falls back to ``_forward_to_agent`` if the agent doesn't support streaming.
+    """
+    client = await get_client()
+    headers = {
+        "X-Correlation-ID": cid,
+        "Accept": "text/event-stream",
+    }
+
+    stream_url = COGNITIVE_AGENT_URL.replace(
+        "/v1/chat/process", "/v1/chat/process-stream",
+    )
+
+    try:
+        async with client.stream(
+            "POST",
+            stream_url,
+            json=payload,
+            headers=headers,
+            timeout=httpx.Timeout(
+                connect=CONNECT_TIMEOUT,
+                read=None,    # streaming — no read timeout
+                write=REQUEST_TIMEOUT,
+                pool=CONNECT_TIMEOUT,
+            ),
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    line = line[6:]
+                if line == "[DONE]":
+                    return
+                try:
+                    parsed = json.loads(line)
+                    yield parsed
+                except json.JSONDecodeError:
+                    logger.warning("Unparseable streaming line: %.80s", line)
+                    continue
+
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            logger.info(
+                "Streaming endpoint unavailable — falling back to non-streaming",
+            )
+            reply = await _forward_to_agent(payload, cid)
+            yield reply
+            return
+        logger.warning(
+            "Agent streaming HTTP %d: %.200s",
+            exc.response.status_code,
+            exc.response.text[:200],
+        )
+        yield dict(FALLBACK_REPLY, ts=int(time.time()))
+    except Exception as exc:
+        logger.warning("Agent streaming error: %s", exc)
+        yield dict(FALLBACK_REPLY, ts=int(time.time()))

@@ -69,15 +69,19 @@ def reply(msg_id: str, reply_body: dict):
     except Exception:
         pass
 
-    # Build complete ChatReply JSON
+    # Build complete ChatReply JSON (v2.0 — no actions, Lua-only)
     import time
+    msg_type = reply_body.get("type", "chat_reply")
     chat_reply = {
-        "type": "chat_reply",
+        "type": msg_type,
         "ts": int(time.time()),
-        "actions": reply_body.get("actions", [{"gait": "none", "param": 0}]),
         "commands": reply_body.get("commands", []),
         "text": reply_body.get("text", ""),
+        "session_id": reply_body.get("session_id", ""),
     }
+    if msg_type == "step":
+        chat_reply["seq"] = reply_body.get("seq", 1)
+        chat_reply["total"] = reply_body.get("total", 1)
 
     # Include robot_uuid so host-listener can queue the reply
     payload = json.dumps(chat_reply).encode()

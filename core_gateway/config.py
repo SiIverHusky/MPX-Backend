@@ -11,7 +11,7 @@ class IngressConfig:
     host: str = os.getenv("CORE_GATEWAY_HOST", "0.0.0.0")
     port: int = int(os.getenv("CORE_GATEWAY_PORT", "8080"))
     workers: int = int(os.getenv("CORE_GATEWAY_WORKERS", "1"))
-    keepalive_interval: float = float(os.getenv("CORE_GATEWAY_KEEPALIVE_INTERVAL", "3.0"))
+
 
 
 @dataclass(slots=True)

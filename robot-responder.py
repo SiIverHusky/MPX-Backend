@@ -125,23 +125,25 @@ def trigger_agent(message: dict, robot_uuid: str, msg_id: str) -> bool:
     """
     text = message.get("text", "")
     msg_type = message.get("type", "user_chat_input")
+    session_id = message.get("session_id", "")
 
     prompt = (
         "A robot message arrived from **" + robot_uuid + "**:\n\n"
         "  " + text + "\n\n"
         "**msg_id:** `" + msg_id + "`\n"
-        "**type:** " + msg_type + "\n\n"
+        "**type:** " + msg_type + "\n"
+        "**session_id:** `" + session_id + "`\n\n"
         "Submit the reply by running the following **single shell command**:\n"
         "```bash\n"
         "python3 /home/mangdang/mpx-server/agent-poller.py reply " + msg_id + " '<reply_json>'\n"
         "```\n\n"
-        "**Reply format: use `commands` array with Lua scripts (this is the required format).**\n"
-        "The JSON must be a valid chat_reply with `commands` instead of the old `actions`.\n\n"
+        "**Reply format: use `commands` array with Lua scripts only (v2.0 protocol).**\n"
+        "The old `actions` format is removed. All robot movement must use Lua.\n\n"
         "Single command example:\n"
         "```json\n"
         '{"text":"Walking forward!","commands":[{"type":"lua","script":"robot.gait(\'advance\')"}]}\n'
         "```\n\n"
-        "Multi-step example:\n"
+        "Multi-step example (use `steps` array to report progress):\n"
         "```json\n"
         '{"text":"Walking 2s, turning, stopping","commands":[\n'
         '  {"type":"lua","script":"robot.gait(\'advance\')"},\n'
@@ -150,6 +152,18 @@ def trigger_agent(message: dict, robot_uuid: str, msg_id: str) -> bool:
         '  {"type":"lua","script":"robot.delay_ms(500)"},\n'
         '  {"type":"lua","script":"robot.gait(\'none\')"}\n'
         "]}\n"
+        "```\n\n"
+        "For multi-stage tasks, you can emit intermediate `step` messages before the final `chat_reply`.\n"
+        "Each step must be a separate reply with `type: \"step\"`:\n"
+        "```json\n"
+        '{"type":"step","text":"Walking forward...","seq":1,"total":3,"session_id":"' + session_id + '"}\n'
+        "```\n"
+        "```json\n"
+        '{"type":"step","text":"Turning...","seq":2,"total":3,"session_id":"' + session_id + '"}\n'
+        "```\n"
+        "Then the final reply:\n"
+        "```json\n"
+        '{"type":"chat_reply","text":"Done!","commands":[{"type":"lua","script":"robot.gait(\'none\')"}],"session_id":"' + session_id + '"}\n'
         "```\n\n"
         "**Available Lua commands** (full reference in /home/mangdang/mpx-server/lua-bindings.md):\n"
         "\n"
@@ -180,13 +194,15 @@ def trigger_agent(message: dict, robot_uuid: str, msg_id: str) -> bool:
         "| Read IMU | `local i=robot.imu_read() print(i.ax,i.ay,i.az,i.gx,i.gy,i.gz)` |\n"
         "| Wait N ms | `robot.delay_ms(N)` |\n"
         "\n"
-        "**Important rules:**\n"
-        "1. Use `commands` array with `lua` type scripts — NOT the old `actions` format.\n"
-        "2. The robot executes commands sequentially with a 5s timeout per script.\n"
+        "**Important rules (v2.0 protocol):**\n"
+        "1. Use `commands` array with `lua` type scripts — the old `actions` format is REMOVED.\n"
+        "2. Robot executes commands sequentially with a 5s timeout per script.\n"
         "3. Use `robot.delay_ms(N)` for timing between gait changes.\n"
         "4. Respond conversationally and naturally for a friendly robot dog.\n"
         "5. The reply JSON must be valid — use proper JSON escaping for Lua quotes.\n"
         "6. Always include `text` for the PWA display.\n"
+        "7. Include `session_id` in every step and chat_reply message.\n"
+        "8. For multi-stage tasks, emit step messages first, then chat_reply.\n"
     )
 
     payload = json.dumps({

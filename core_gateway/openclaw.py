@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 
@@ -56,20 +56,22 @@ FALLBACK_REPLY = json.dumps({
     "commands": [],
 })
 
+FALLBACK_REPLY_DICT = json.loads(FALLBACK_REPLY)
+
 
 async def openclaw_process(msg: dict[str, Any], robot_uuid: str) -> str:
-    """Send a decrypted message to OpenClaw and get a reply JSON string.
+    """Send a decrypted message to OpenClaw (non-streaming) and get a reply.
 
     Args:
         msg: Decrypted message dict. Expected keys:
             - ``type``: ``"user_chat_input"`` or ``"session_reset"``
             - ``text``: user's message text (for ``user_chat_input``)
+            - ``session_id``: conversation UUID (optional)
             - ``ts``: Unix timestamp
         robot_uuid: Robot identifier string (e.g. ``"MPX-DOG-01"``).
 
     Returns:
-        JSON string to encrypt and send back downstream.  Must be a valid
-        ``chat_reply`` per CLOUD_INGRESS.md §4.2.
+        JSON string to encrypt and send back downstream.
 
     If OpenClaw is unreachable or returns an error after all retries, a
     safe fallback reply is returned so the robot never hangs.
@@ -126,6 +128,92 @@ async def openclaw_process(msg: dict[str, Any], robot_uuid: str) -> str:
         openclaw_settings.max_retries + 1,
     )
     return FALLBACK_REPLY
+
+
+# ---------------------------------------------------------------------------
+# Streaming OpenClaw process call
+# ---------------------------------------------------------------------------
+
+async def openclaw_process_stream(
+    msg: dict[str, Any],
+    robot_uuid: str,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Send a message to OpenClaw and yield each downstream message as it arrives.
+
+    OpenClaw returns a stream of JSON objects (one per line via SSE or
+    JSON-lines format):
+      1. Zero or more ``step`` messages (intermediate progress)
+      2. One ``chat_reply`` message (final response with Lua commands)
+
+    Args:
+        msg: Decrypted message dict with ``type``, ``text``, ``session_id``.
+        robot_uuid: Robot identifier string.
+
+    Yields:
+        Dicts representing downstream messages (``step`` or ``chat_reply``).
+
+    If streaming is not supported by OpenClaw (falls back to non-streaming),
+    a single ``chat_reply`` dict is yielded.
+    """
+    client = await get_client()
+
+    headers: dict[str, str] = {
+        "Accept": "text/event-stream",
+    }
+    if openclaw_settings.api_key:
+        headers["Authorization"] = f"Bearer {openclaw_settings.api_key}"
+
+    payload = {
+        "robot_uuid": robot_uuid,
+        "message": msg,
+    }
+
+    try:
+        async with client.stream(
+            "POST",
+            "/v1/chat/process-stream",
+            json=payload,
+            headers=headers,
+            timeout=openclaw_settings.request_timeout,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                # SSE format: "data: <json>" or raw JSON-lines
+                if line.startswith("data: "):
+                    line = line[6:]
+                if line == "[DONE]":
+                    return
+                try:
+                    parsed = json.loads(line)
+                    yield parsed
+                except json.JSONDecodeError:
+                    logger.warning("Unparseable streaming line: %.80s", line)
+                    continue
+
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            # Streaming endpoint not available — fall back to non-streaming
+            logger.info(
+                "Streaming endpoint unavailable for %s — using non-streaming",
+                robot_uuid,
+            )
+            reply_str = await openclaw_process(msg, robot_uuid)
+            yield json.loads(reply_str)
+            return
+        logger.warning(
+            "OpenClaw streaming HTTP %d for %s: %.200s",
+            exc.response.status_code, robot_uuid, exc.response.text[:200],
+        )
+        yield FALLBACK_REPLY_DICT
+    except Exception as exc:
+        logger.warning(
+            "OpenClaw streaming error for %s: %s",
+            robot_uuid, exc,
+        )
+        yield FALLBACK_REPLY_DICT
 
 
 # ---------------------------------------------------------------------------

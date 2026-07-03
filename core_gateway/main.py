@@ -10,9 +10,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from crypto import build_downstream_frame, build_downstream_frame_with_iv, decrypt_frame, lookup_key_by_uuid
-from config import settings
-from openclaw import openclaw_process, shutdown_client
-from protocol.packets import ChatReply, GaitAction
+from openclaw import openclaw_process, openclaw_process_stream, shutdown_client
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -64,16 +62,11 @@ async def _handle_ingress(socket: WebSocket) -> None:
       - Upstream JSON: {"type":"user_chat_input","text":"..."}
       - Downstream JSON: {"type":"chat_reply","text":"...","actions":[...]}
 
-    The ESP32 WebSocket client starts ``recv()`` immediately on connect
-    with a short timeout.  To prevent the connection from dying during
-    idle periods (no user input), a background keep-alive task sends
-    lightweight encrypted frames every 3 seconds.
     """
     await socket.accept()
 
     robot_uuid: bytes | None = None
     robot_uuid_str: str | None = None
-    _keepalive_task: asyncio.Task | None = None
 
     try:
         # ── Wait for the first frame to discover the robot's UUID ──
@@ -104,25 +97,6 @@ async def _handle_ingress(socket: WebSocket) -> None:
                     robot_uuid_str,
                 )
 
-            # ── Start keep-alive background task ─────────────────
-            async def _keepalive():
-                """Send an encrypted empty frame every 3 s to keep
-                the ESP32's recv() from timing out."""
-                ka_payload = ChatReply(
-                    text="",
-                    actions=[GaitAction(gait="none", param=0)],
-                    commands=[],
-                ).model_dump_json().encode("utf-8")
-                while True:
-                    await asyncio.sleep(settings.keepalive_interval)
-                    try:
-                        frame = build_downstream_frame(robot_uuid, key, ka_payload)
-                        await socket.send_bytes(frame)
-                    except Exception:
-                        break
-
-            _keepalive_task = asyncio.create_task(_keepalive())
-
             # ── Process the first message ────────────────────────
             await _process_chat_frame(socket, robot_uuid, robot_uuid_str, key, iv, plaintext)
 
@@ -145,9 +119,6 @@ async def _handle_ingress(socket: WebSocket) -> None:
             await socket.close(code=1011, reason="Internal error")
         except Exception:
             pass
-    finally:
-        if _keepalive_task is not None:
-            _keepalive_task.cancel()
 
 
 # Both paths handled by the same logic — the ESP32 firmware may
@@ -210,7 +181,13 @@ async def _process_chat_frame(
     iv: bytes,
     plaintext: bytes,
 ) -> None:
-    """Decrypt, route to OpenClaw, encrypt reply, and send."""
+    """Decrypt, route to OpenClaw via streaming, encrypt and send each message.
+
+    For multi-step tasks, OpenClaw may return multiple frames:
+      1. Zero or more ``step`` frames (intermediate progress)
+      2. One ``chat_reply`` frame (final response with Lua commands)
+    Each frame is encrypted independently with a fresh IV.
+    """
     try:
         data = json.loads(plaintext)
     except json.JSONDecodeError:
@@ -218,10 +195,11 @@ async def _process_chat_frame(
         return
 
     msg_type = data.get("type")
+    session_id = data.get("session_id", "")
 
     # ── session_reset: forward to OpenClaw, discard context ──────
     if msg_type == "session_reset":
-        logger.info("Session reset for %s", robot_uuid_str)
+        logger.info("Session reset for %s (session=%s)", robot_uuid_str, session_id)
         reply_json = await openclaw_process(data, robot_uuid_str)
         frame = build_downstream_frame_with_iv(robot_uuid, key, iv, reply_json.encode("utf-8"))
         await socket.send_bytes(frame)
@@ -236,12 +214,22 @@ async def _process_chat_frame(
     if not user_text:
         return
 
-    logger.info("Chat from %s: %.120s", robot_uuid_str, user_text)
+    logger.info(
+        "Chat from %s (session=%s): %.120s",
+        robot_uuid_str, session_id, user_text,
+    )
 
-    # ── Call OpenClaw agent ──────────────────────────────────────
-    reply_json = await openclaw_process(data, robot_uuid_str)
+    # ── Call OpenClaw agent — streaming ──────────────────────────
+    async for downstream_msg in openclaw_process_stream(data, robot_uuid_str):
+        # Each message gets its own IV (step streaming uses fresh per-frame IVs)
+        payload_bytes = json.dumps(downstream_msg).encode("utf-8")
+        frame = build_downstream_frame(robot_uuid, key, payload_bytes)
+        await socket.send_bytes(frame)
+        logger.debug(
+            "Sent downstream %s to %s: %.80s",
+            downstream_msg.get("type", "?"),
+            robot_uuid_str,
+            str(downstream_msg.get("text", ""))[:80],
+        )
 
-    # ── Encrypt and send reply (reusing upstream IV per spec) ────
-    frame = build_downstream_frame_with_iv(robot_uuid, key, iv, reply_json.encode("utf-8"))
-    await socket.send_bytes(frame)
-    logger.info("Replied to %s: %.120s", robot_uuid_str, json.loads(reply_json).get("text", "")[:120])
+    logger.info("Streaming reply complete for %s", robot_uuid_str)
