@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=mangdang
 WorkingDirectory=/home/mangdang/mpx-server
+EnvironmentFile=/home/mangdang/mpx-server/.env
 ExecStart=/usr/bin/python3 /home/mangdang/mpx-server/host-listener.py \
     --port 19090 \
     --data-dir /tmp/mpx-bridge-data

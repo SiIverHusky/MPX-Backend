@@ -498,8 +498,23 @@ class Handler(BaseHTTPRequestHandler):
             message = data.get("message", {})
             msg_id = store.store_pending(robot_uuid, message)
 
+            # session_reset: store pending for robot-responder logging,
+            # but don't block — nobody submits a reply for it.
+            msg_type = message.get("type", "")
+            if msg_type == "session_reset":
+                ack = {
+                    "type": "chat_reply",
+                    "text": "🤖 Session reset acknowledged.",
+                    "ts": int(time.time()),
+                    "actions": [{"gait": "none", "param": 0}],
+                    "commands": [],
+                }
+                self._send_json(200, ack)
+                return
+
             # Block and wait for the reply (efficient condition wait)
-            reply = store.wait_for_reply(msg_id, timeout=25)
+            reply_timeout = float(os.getenv("WAIT_FOR_REPLY_TIMEOUT", "600.0"))
+            reply = store.wait_for_reply(msg_id, timeout=reply_timeout)
 
             if reply is not None:
                 self._send_json(200, reply)

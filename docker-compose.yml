@@ -13,7 +13,7 @@ services:
       # OpenClaw autonomous agent connection → routed via openclaw-bridge
       OPENCLAW_BASE_URL: ${OPENCLAW_BASE_URL:-http://openclaw-bridge:9090}
       OPENCLAW_API_KEY: ${OPENCLAW_API_KEY:-}
-      OPENCLAW_TIMEOUT: ${OPENCLAW_TIMEOUT:-180.0}
+      OPENCLAW_TIMEOUT: ${OPENCLAW_TIMEOUT:-600.0}
       OPENCLAW_MAX_RETRIES: ${OPENCLAW_MAX_RETRIES:-2}
     ports:
       - "8080:8080"
@@ -37,7 +37,7 @@ services:
       # on Linux, set COGNITIVE_AGENT_URL to the host LAN IP, e.g.:
       #   COGNITIVE_AGENT_URL=http://10.170.0.3:19090/v1/chat/process
       COGNITIVE_AGENT_URL: ${COGNITIVE_AGENT_URL:-http://host.docker.internal:19090/v1/chat/process}
-      BRIDGE_TIMEOUT: "30.0"
+      BRIDGE_TIMEOUT: "${BRIDGE_TIMEOUT:-600.0}"
       BRIDGE_MAX_RETRIES: "2"
     ports:
       - "9090:9090"
