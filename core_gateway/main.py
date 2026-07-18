@@ -10,7 +10,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from crypto import build_downstream_frame, build_downstream_frame_with_iv, decrypt_frame, lookup_key_by_uuid
-from openclaw import openclaw_process, openclaw_process_stream, shutdown_client
+from openclaw import openclaw_process, openclaw_process_stream, send_lua_output, shutdown_client
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -62,54 +62,57 @@ async def _handle_ingress(socket: WebSocket) -> None:
       - Upstream JSON: {"type":"user_chat_input","text":"..."}
       - Downstream JSON: {"type":"chat_reply","text":"...","actions":[...]}
 
+    Uses a **single** ``async for`` loop to receive all frames.  The first
+    valid frame establishes the robot's identity (UUID + AES key); subsequent
+    frames are processed uniformly.
     """
     await socket.accept()
 
     robot_uuid: bytes | None = None
     robot_uuid_str: str | None = None
+    key: bytes | None = None
 
     try:
-        # ── Wait for the first frame to discover the robot's UUID ──
         async for message in socket.iter_bytes():
             result = decrypt_frame(message)
             if result is None:
-                logger.warning("Auth failure — dropping connection")
-                await socket.close(code=1008, reason="Auth failure")
-                return
+                if robot_uuid is None:
+                    # First frame must authenticate
+                    logger.warning("Auth failure — dropping connection")
+                    await socket.close(code=1008, reason="Auth failure")
+                    return
+                # Subsequent decryption failures are silently skipped
+                continue
 
-            robot_uuid, iv, plaintext = result
-            robot_uuid_str = robot_uuid.decode("utf-8", errors="replace")
+            frame_uuid, iv, plaintext = result
 
-            key = lookup_key_by_uuid(robot_uuid)
-            if key is None:
-                logger.warning("No key for %s — dropping", robot_uuid_str)
-                await socket.close(code=1008, reason="Unknown robot")
-                return
+            # ── First valid frame — discover robot identity ──────
+            if robot_uuid is None:
+                robot_uuid = frame_uuid
+                robot_uuid_str = robot_uuid.decode("utf-8", errors="replace")
 
-            logger.info("Robot %s connected", robot_uuid_str)
+                key = lookup_key_by_uuid(robot_uuid)
+                if key is None:
+                    logger.warning("No key for %s — dropping", robot_uuid_str)
+                    await socket.close(code=1008, reason="Unknown robot")
+                    return
 
-            # ── Check for queued reply from previous session ─────
-            queued_reply = await _check_pending_reply(robot_uuid_str, key, robot_uuid, socket)
-            if queued_reply is not None:
-                # Queued reply was sent to the robot — proceed normally
-                logger.info(
-                    "Delivered queued reply to %s, awaiting next message",
-                    robot_uuid_str,
+                logger.info("Robot %s connected", robot_uuid_str)
+
+                # ── Check for queued reply from previous session ─
+                queued_reply = await _check_pending_reply(
+                    robot_uuid_str, key, robot_uuid, socket,
                 )
+                if queued_reply is not None:
+                    logger.info(
+                        "Delivered queued reply to %s, awaiting next message",
+                        robot_uuid_str,
+                    )
 
-            # ── Process the first message ────────────────────────
-            await _process_chat_frame(socket, robot_uuid, robot_uuid_str, key, iv, plaintext)
-
-            # ── Continue receiving subsequent frames ─────────────
-            async for message in socket.iter_bytes():
-                result = decrypt_frame(message)
-                if result is None:
-                    continue
-                _, iv, plaintext = result
-                await _process_chat_frame(socket, robot_uuid, robot_uuid_str, key, iv, plaintext)
-
-            # If we exit the for-loop the connection was closed
-            break
+            # ── Process every frame (chat, Lua output, etc.) ─────
+            await _process_chat_frame(
+                socket, robot_uuid, robot_uuid_str, key, iv, plaintext,
+            )
 
     except WebSocketDisconnect:
         logger.info("Robot %s disconnected", robot_uuid_str or "unknown")
@@ -207,7 +210,20 @@ async def _process_chat_frame(
 
     # ── Only handle user_chat_input ──────────────────────────────
     if msg_type != "user_chat_input":
-        logger.debug("Ignoring non-chat frame type=%s", msg_type)
+        # ── Forward any non-chat frame as Lua output to the agent ──
+        lua_text = data.get("text", "")
+        lua_session = data.get("session_id", "")
+        if lua_text:
+            logger.info(
+                "Lua output from %s (type=%s, session=%s): %.120s",
+                robot_uuid_str, msg_type, lua_session, lua_text,
+            )
+            await send_lua_output(robot_uuid_str, lua_text, lua_session)
+        else:
+            logger.debug(
+                "Ignoring non-chat frame type=%s (no text) from %s",
+                msg_type, robot_uuid_str,
+            )
         return
 
     user_text = data.get("text", "").strip()

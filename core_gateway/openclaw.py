@@ -36,6 +36,53 @@ async def get_client() -> httpx.AsyncClient:
     return _client
 
 
+async def send_lua_output(
+    robot_uuid: str,
+    text: str,
+    session_id: str = "",
+) -> bool:
+    """Send Lua output (fire-and-forget) to the host-listener via bridge.
+
+    The output is injected as a pending ``user_chat_input`` message with text
+    ``"Lua result: ..."``  so the agent (robot-responder) picks it up in its
+    next poll cycle and routes it to the OpenClaw chat session.
+
+    Args:
+        robot_uuid: Robot identifier string (e.g. ``"MPX-DOG-01"``).
+        text: The raw Lua print output text.
+        session_id: The conversation session UUID to preserve context.
+
+    Returns:
+        ``True`` if the output was delivered to the bridge, ``False`` otherwise.
+    """
+    client = await get_client()
+
+    payload = {
+        "robot_uuid": robot_uuid,
+        "text": text,
+        "session_id": session_id,
+    }
+
+    headers: dict[str, str] = {}
+    if openclaw_settings.api_key:
+        headers["Authorization"] = f"Bearer {openclaw_settings.api_key}"
+
+    try:
+        resp = await client.post(
+            "/v1/chat/lua-output",
+            json=payload,
+            headers=headers,
+            timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0),
+        )
+        return resp.status_code == 201
+    except httpx.RequestError as exc:
+        logger.warning(
+            "Failed to send Lua output for %s: %s",
+            robot_uuid, exc,
+        )
+        return False
+
+
 async def shutdown_client() -> None:
     """Gracefully close the shared HTTP client."""
     global _client

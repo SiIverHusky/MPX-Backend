@@ -279,6 +279,67 @@ async def pending_reply(request: Request, robot_uuid: str):
 
 
 # ---------------------------------------------------------------------------
+# Lua output — proxy to host-listener
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/chat/lua-output")
+async def lua_output(request: Request):
+    """Receive Lua output from core_gateway and proxy to the host-listener.
+
+    The host-listener's ``/v1/lua/output`` endpoint stores the output as a
+    pending ``user_chat_input`` message which robot-responder picks up.
+
+    Expects JSON: ``{"robot_uuid": "...", "text": "...", "session_id": "..."}``
+    """
+    cid = _set_cid(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+
+    robot_uuid = body.get("robot_uuid", "unknown")
+    text = body.get("text", "")
+    session_id = body.get("session_id", "")
+
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "text field is required"})
+
+    # Proxy to the host-listener's /v1/lua/output
+    agent_base = COGNITIVE_AGENT_URL.rstrip("/v1/chat/process").rstrip("/")
+    lua_url = f"{agent_base}/v1/lua/output"
+
+    client = await get_client()
+    try:
+        resp = await client.post(
+            lua_url,
+            json=body,
+            timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0),
+        )
+        if resp.status_code == 201:
+            logger.info(
+                "Lua output proxied for %s (session=%s): %.100s",
+                robot_uuid, session_id, text[:100],
+            )
+        else:
+            logger.warning(
+                "Host-listener returned HTTP %d for Lua output: %.200s",
+                resp.status_code, resp.text[:200],
+            )
+        return JSONResponse(
+            status_code=resp.status_code,
+            content=resp.json() if resp.text else {"status": "ok"},
+        )
+    except httpx.RequestError as exc:
+        logger.warning("Failed to proxy Lua output to host-listener: %s", exc)
+        return JSONResponse(
+            status_code=502,
+            content={"error": "host-listener unreachable"},
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main process endpoint
 # ---------------------------------------------------------------------------
 

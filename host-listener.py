@@ -549,6 +549,30 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_error(400, "Invalid path")
 
+        elif path == "/v1/lua/output":
+            try:
+                lua_text = data.get("text", "")
+                lua_session = data.get("session_id", "")
+                lua_robot = data.get("robot_uuid", "unknown")
+                if not lua_text:
+                    self._send_json(400, {"error": "text field required"})
+                    return
+                msg_body = {
+                    "type": "user_chat_input",
+                    "text": f"Lua result: {lua_text}",
+                    "session_id": lua_session,
+                    "ts": int(time.time()),
+                }
+                msg_id = store.store_pending(lua_robot, msg_body)
+                self._send_json(201, {"msg_id": msg_id})
+                logger.info(
+                    "Lua output stored as pending %s for %s (session=%s)",
+                    msg_id, lua_robot, lua_session,
+                )
+            except Exception as e:
+                logger.error("Failed to store Lua output: %s", e)
+                self._send_error(500, str(e))
+
         else:
             self._send_error(404, "Not found")
 
