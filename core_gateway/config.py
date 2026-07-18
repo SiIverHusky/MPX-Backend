@@ -24,6 +24,28 @@ class OpenClawConfig:
     max_retries: int = int(os.getenv("OPENCLAW_MAX_RETRIES", "2"))
 
 
+@dataclass(slots=True)
+class DatabaseConfig:
+    """Configuration for PostgreSQL (Cloud SQL emulation)."""
+
+    host: str = os.getenv("DB_HOST", "localhost")
+    port: int = int(os.getenv("DB_PORT", "5432"))
+    user: str = os.getenv("DB_USER", "mpx_admin")
+    password: str = os.getenv("DB_PASSWORD", "")
+    db_name: str = os.getenv("DB_NAME", "mpx_marketplace_prod")
+    jwt_secret: str = os.getenv("JWT_SECRET", "fallback_dev_secret")
+
+
+@dataclass(slots=True)
+class StorageConfig:
+    """Configuration for GCS (Cloud Storage emulation)."""
+
+    endpoint: str = os.getenv("GCS_ENDPOINT", "http://localhost:4443")
+    bucket: str = os.getenv("GCS_BUCKET", "mpx-marketplace-artifacts")
+
+
 # Singletons
 settings = IngressConfig()
 openclaw_settings = OpenClawConfig()
+db_settings = DatabaseConfig()
+storage_settings = StorageConfig()

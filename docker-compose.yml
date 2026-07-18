@@ -2,6 +2,7 @@ services:
   core_gateway:
     build:
       context: ./core_gateway
+    container_name: gcp-cloudrun-core-gateway
     environment:
       CORE_GATEWAY_HOST: ${CORE_GATEWAY_HOST:-0.0.0.0}
       CORE_GATEWAY_PORT: ${CORE_GATEWAY_PORT:-8080}
@@ -15,18 +16,30 @@ services:
       OPENCLAW_API_KEY: ${OPENCLAW_API_KEY:-}
       OPENCLAW_TIMEOUT: ${OPENCLAW_TIMEOUT:-600.0}
       OPENCLAW_MAX_RETRIES: ${OPENCLAW_MAX_RETRIES:-2}
+
+      # -- DB CREDENTIALS POINTER --
+      DB_HOST: cloudsql-postgres
+      DB_PORT: 5432
+      DB_USER: mpx_admin
+      DB_PASSWORD: mpx_secret_dev_password
+      DB_NAME: mpx_marketplace_prod
+      JWT_SECRET: mpx_super_secret_jwt_key_2026
+
+      # -- UNIFIED STORAGE PARAMETERS --
+      GCS_ENDPOINT: http://cloudstorage-emulator:4443
+      GCS_BUCKET: mpx-marketplace-artifacts
     ports:
       - "8080:8080"
     restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp
     depends_on:
       - openclaw-bridge
+    networks:
+      - mpx-gcp-mesh
 
   openclaw-bridge:
     build:
       context: ./openclaw-bridge
+    container_name: gcp-cloudrun-openclaw-bridge
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -42,7 +55,10 @@ services:
     ports:
       - "9090:9090"
     restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp
+    networks:
+      - mpx-gcp-mesh
 
+networks:
+  mpx-gcp-mesh:
+    external:
+      name: mpx-shared-mesh
