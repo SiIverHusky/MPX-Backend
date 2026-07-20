@@ -54,6 +54,9 @@ GATEWAY_TOKEN = (
 )
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
 CHAT_TIMEOUT = float(os.getenv("CHAT_TIMEOUT", "600.0"))
+CORE_GATEWAY_URL = os.getenv(
+    "CORE_GATEWAY_URL", "http://127.0.0.1:8080"
+)
 
 
 
@@ -120,6 +123,25 @@ def fetch_pending() -> list[dict]:
             return json.loads(r.read())
     except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
         logger.debug("Error fetching pending: %s", e)
+        return []
+
+
+def fetch_enabled_skills(robot_uuid: str) -> list[dict]:
+    """Fetch only enabled skills for this robot from the core_gateway.
+
+    Returns a list of skill dicts with keys:
+      skill_id, title, skill_type, current_version
+    Returns [] if the gateway is unreachable or no skills are assigned.
+    """
+    url = f"{CORE_GATEWAY_URL}/v1/robots/{robot_uuid}/skills"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            all_skills = json.loads(r.read())
+        # Filter to only enabled ones (backend now returns all with status)
+        return [s for s in all_skills if s.get("enabled", False)]
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
+        logger.debug("Error fetching skills for %s: %s", robot_uuid, e)
         return []
 
 
@@ -316,42 +338,93 @@ read–eval–feedback loop:
  4. You receive this back as if the user typed it, so you can SEE the
  results of your own commands and use them for further reasoning
 
---- MPX-AWA CLI — Agentic Web Actions ---
+--- AWA Skills (Agentic Web Actions) ---
 
-You have access to the **mpx-awa** CLI tool for browser-based web actions.
-This lets you search websites, get product info, add items to carts, and
-more — all through real browser automation running inside the AWA Worker
-service.
+Some skills assigned to this robot are type AWA — they use **browser automation**
+(Playwright + V8 sandbox) to interact with websites on your behalf. You can
+search products, get details, add to cart, read cart contents, and retrieve
+checkout links.
 
-You can run mpx-awa CLI commands directly via your available shell
-execution capability. Use `mpx-awa --help` to see all commands.
+AWA skills are **session-based**: each session keeps a persistent browser
+context (V8 isolate + Playwright page) across multiple actions.
 
-### Commands
+Each AWA skill has a **manifest** that documents every action it supports:
 
-```
-mpx-awa list                                      # List available web skill domains
-mpx-awa readme <domain>                            # View a skill's full guide/docs
-mpx-awa session start <domain>                     # Start a browser session
-mpx-awa session list                               # Show active sessions + worker health
-mpx-awa session get <sessionId>                    # Session status
-mpx-awa session action <id> <action> '<params>'    # Dispatch site interaction
-mpx-awa session end <sessionId>                    # End session, free resources
-```
+  - Action name (e.g. search, getProduct, addToCart)
+  - Parameters (name, type, required, description)
+  - Return values per action
+  - Concrete examples with params + expected result
 
-**Dispatch example (params as JSON string):**
-```
-mpx-awa session action sess_abc search '{"query":"laptop"}'
-mpx-awa session action sess_abc addToCart '{"quantity":1}'
-```
+To inspect a skill's documented actions and their params/returns:
 
-### Rules
+  mpx-awa readme <skill_id>
+  mpx-awa readme <skill_id> --json       # raw JSON for programmatic use
 
-1. Always start a session before dispatching actions.
-2. Sessions have a 15-minute idle timeout — end them promptly.
-3. Always end sessions after completing your actions to free resources.
-4. If an action returns `status="blocked"`, the site detected automation.
-5. Use `mpx-awa list` to see what's available at any time.
-6. Use `mpx-awa readme <domain>` for detailed action parameters and examples.
+--- SESSION LIFECYCLE ---
+
+AWA actions go through a session lifecycle:
+
+  1. Start session:   POST /v1/awa/session/start
+     Body: { skill_id, version, robot_uuid }
+     Returns: { sessionId, status: "ready" }
+
+  2. Dispatch action: POST /v1/awa/session/:id/action
+     Body: { action: "<action_name>", params: { ... } }
+     Returns: { status, data, errorDetails }
+
+  3. End session:     POST /v1/awa/session/:id/end
+     Frees the browser + isolate resources.
+
+Sessions idle for 15 minutes auto-close. Action timeout is 30s per action.
+
+--- ACTION RESPONSE FORMAT ---
+
+Successful action response (status: "success"):
+  {
+    "status": "success",
+    "data": {
+      // Action-specific fields — documented in the manifest.
+      // Example for search:
+      "query": "wireless mouse",
+      "resultCount": 16,
+      "products": [
+        { "asin": "B004YAVF8I", "title": "Logitech M185", "price": "$14.99", "rating": 4.5 }
+      ],
+      "firstProduct": { ... }
+    },
+    "sessionId": "sess_abc123"
+  }
+
+Blocked action response (status: "blocked"):
+  The merchant site detected automated access. The response includes:
+  {
+    "status": "blocked",
+    "data": { "detection": [...], "blockedBy": "amazon.com", ... },
+    "_warning": { "type": "BOT_DETECTION", "message": "..." }
+  }
+  When blocked: inform the user, clean up the blocked session (end it),
+  and suggest trying again later or with different parameters.
+
+Other status values: "failed", "out_of_stock", "not_found"
+
+--- KEY PRINCIPLES ---
+
+1. Each skill's manifest tells you exactly what params each action accepts
+   and what it returns. Read the manifest before dispatching.
+
+2. The browser persists across actions in a session — you can getProduct
+   then addToCart on the same page without re-navigating.
+
+3. For skills with addToCart: if you call getProduct first, the next
+   addToCart can omit params (already on the product page). If you're
+   calling addToCart standalone, include the product identifier.
+
+4. If a session is blocked or you're done, always end the session
+   to free browser + isolate resources.
+
+5. Use results from AWA actions to inform your response to the user.
+   E.g., if search returns products, describe them to the user and ask
+   which one they'd like to examine or add to cart.
 
 --- RESPONSE RULES ---
 
@@ -453,13 +526,29 @@ def process_message(message: dict, robot_uuid: str, msg_id: str) -> bool:
     # ── Build the user key for session routing ──
     user_key = f"mpx:{robot_uuid}:{session_id}" if session_id else f"mpx:{robot_uuid}"
 
+    # ── Fetch enabled skills and build context ──
+    enabled_skills = fetch_enabled_skills(robot_uuid)
+    if enabled_skills:
+        skills_section = "\n--- YOUR ENABLED SKILLS ---\n"
+        skills_section += "These skills are currently active on this robot. Only use these.\n\n"
+        for s in enabled_skills:
+            skills_section += f"- {s['skill_id']}: {s['title']} ({s['skill_type']}, v{s['current_version']})\n"
+        skills_section += (
+            "\nTo inspect a skill's available actions, check its readme:\n"
+            "  mpx-awa readme <skill_id>\n"
+        )
+    else:
+        skills_section = ""
+
+    system_content = SYSTEM_PROMPT + skills_section
+
     # ── Build the chat completion request ──
     payload = {
         "model": "openclaw/default",
         "user": user_key,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text},
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"[Robot: {robot_uuid}]\n{text}"},
         ],
         "max_tokens": 1024,
     }

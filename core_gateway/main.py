@@ -17,7 +17,8 @@ from fastapi.responses import JSONResponse
 from google.cloud import storage as gcs_storage
 
 from config import db_settings, storage_settings
-from crypto import build_downstream_frame, build_downstream_frame_with_iv, decrypt_frame, lookup_key_by_uuid
+from crypto import build_downstream_frame, build_downstream_frame_with_iv, decrypt_frame, load_keys_from_db, lookup_key_by_uuid
+from robots import router as robots_router, init as init_robots
 from openclaw import openclaw_process, openclaw_process_stream, send_lua_output, shutdown_client
 
 # ---------------------------------------------------------------------------
@@ -102,6 +103,10 @@ def verify_pbkdf2_sha256(password: str, stored_hash: str) -> bool:
 async def lifespan(app: FastAPI):
     """Application lifespan."""
     logger.info("Starting MPX Chat Ingress Gateway (protocol v1.0)")
+    # Pre-warm the DB pool and load robot crypto keys
+    pool = await get_pg_pool()
+    init_robots(get_pg_pool)
+    await load_keys_from_db(pool)
     yield
     logger.info("Shutting down core gateway...")
     global pg_pool, gcs_client
@@ -114,6 +119,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="MPX Chat Ingress Gateway", version="2.0.0", lifespan=lifespan)
+app.include_router(robots_router)
 
 
 @app.get("/healthz")
@@ -166,6 +172,152 @@ async def check_skill_slug(request: Request) -> JSONResponse:
     if row:
         return JSONResponse(content={"exists": True, "skill_id": skill_id})
     return JSONResponse(content={"exists": False})
+
+
+# ---------------------------------------------------------------------------
+# REST — Marketplace discovery (no auth required)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/skills")
+async def list_skills() -> JSONResponse:
+    """List all skills in the marketplace.
+
+    No auth required.
+
+    Returns::
+        [{"id", "title", "skill_type", "current_version", "created_at"}, ...]
+    """
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, title, skill_type, current_version, created_at "
+            "FROM marketplace_skills ORDER BY created_at DESC",
+        )
+    skills = [
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "skill_type": row["skill_type"],
+            "current_version": row["current_version"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        for row in rows
+    ]
+    return JSONResponse(content=skills)
+
+
+@app.get("/v1/skills/{skill_id}/versions")
+async def list_skill_versions(skill_id: str) -> JSONResponse:
+    """List all versions of a specific skill.
+
+    No auth required.
+
+    Returns::
+        [{"version", "gcs_artifact_path", "created_at"}, ...]
+    """
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT version, gcs_artifact_path, created_at "
+            "FROM skill_versions WHERE skill_id = $1 "
+            "ORDER BY created_at DESC",
+            skill_id,
+        )
+    versions = [
+        {
+            "version": row["version"],
+            "gcs_artifact_path": row["gcs_artifact_path"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        for row in rows
+    ]
+    return JSONResponse(content=versions)
+
+
+@app.get("/v1/skills/{skill_id}/manifest")
+async def get_skill_manifest(skill_id: str, version: str | None = None) -> JSONResponse:
+    """Get the manifest for a specific skill version.
+
+    No auth required. If version is omitted, uses the current_version from
+    marketplace_skills.
+
+    Query params:
+        version (str, optional): e.g., "v1.0.0"
+
+    Returns::
+        The manifest JSON content directly.
+    """
+    if not version:
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT current_version FROM marketplace_skills WHERE id = $1",
+                skill_id,
+            )
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "skill not found"})
+        version = f"v{row['current_version']}"
+    else:
+        # Ensure it starts with v
+        if not version.startswith("v"):
+            version = f"v{version}"
+
+    manifest_path = f"skills/{skill_id}/versions/{version}/manifest.json"
+    logger.info("Fetching manifest from gs://%s/%s", storage_settings.bucket, manifest_path)
+
+    client = get_gcs_client()
+    bucket = client.bucket(storage_settings.bucket)
+    blob = bucket.blob(manifest_path)
+
+    if not blob.exists():
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"manifest not found at {manifest_path}"},
+        )
+
+    manifest_bytes = blob.download_as_bytes()
+    try:
+        manifest_data = json.loads(manifest_bytes)
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "manifest is not valid JSON"},
+        )
+
+    return JSONResponse(content=manifest_data)
+
+
+@app.get("/v1/skills/{skill_id}")
+async def get_skill(skill_id: str) -> JSONResponse:
+    """Get a single skill by its ID, including current_version.
+
+    No auth required.
+
+    Returns::
+        {"id", "title", "skill_type", "current_version", "created_at", ...}
+    """
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, developer_id, title, skill_type, current_version, source_language, "
+            "created_at "
+            "FROM marketplace_skills WHERE id = $1",
+            skill_id,
+        )
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "skill not found"})
+
+    skill = {
+        "id": row["id"],
+        "developer_id": row["developer_id"],
+        "title": row["title"],
+        "skill_type": row["skill_type"],
+        "current_version": row["current_version"],
+        "source_language": row["source_language"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+    return JSONResponse(content=skill)
 
 
 @app.post("/v1/auth/signup")

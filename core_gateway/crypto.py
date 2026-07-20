@@ -68,6 +68,38 @@ def _get_key_store() -> dict[bytes, bytes]:
     return _KEY_STORE
 
 
+async def load_keys_from_db(pool) -> int:
+    """Load robot AES keys from the database into the in-memory store.
+
+    Queries the ``robots`` table for all rows and registers each
+    UUID→key mapping.  Returns the number of keys loaded.
+
+    This is called once during gateway startup (see ``main.py`` lifespan).
+    """
+    store = _get_key_store()
+    count = 0
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT robot_uuid, aes_key_hex FROM robots",
+            )
+        for row in rows:
+            uuid_bytes = _normalize_uuid(row["robot_uuid"].encode("utf-8"))
+            key = bytes.fromhex(row["aes_key_hex"])
+            if len(key) != 32:
+                logger.warning(
+                    "Skipping robot %s: aes_key_hex has %d bytes, expected 32",
+                    row["robot_uuid"], len(key),
+                )
+                continue
+            store[uuid_bytes] = key
+            count += 1
+        logger.info("Loaded %d robot key(s) from database", count)
+    except Exception as exc:
+        logger.warning("Failed to load keys from database: %s", exc)
+    return count
+
+
 def register_key(robot_uuid: bytes, key: bytes) -> None:
     """Register a robot's AES-256 key in the in-memory store.
 
