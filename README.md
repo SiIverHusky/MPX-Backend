@@ -1,141 +1,62 @@
-# MPX Chat Ingress Gateway
+# MPX Backend — Chat Ingress & Marketplace Gateway
 
-Encrypted WebSocket bridge between MPX robot hardware and a cognitive agent (OpenClaw).
+Encrypted WebSocket bridge between MPX robot hardware (ESP32) and a cognitive agent (OpenClaw), plus a WASM skill marketplace with robot deployment.
 
-## Architecture
+## Architecture (v2.0 — Streaming + Sessions + Lua)
 
 ```
-┌──────────────┐   AES-256-GCM   ┌──────────────┐   HTTP POST    ┌──────────────────┐   HTTP POST    ┌───────────┐
-│  Robot HW    │  WebSocket      │  core_gateway │ ─────────────→ │ openclaw-bridge  │ ─────────────→ │ Agent     │
-│  (ESP32)     │ ←─────────────→ │  (:8080)      │                │  (:9090)         │                │ (OpenClaw)│
-└──────────────┘   encrypted     └──────────────┘   decrypted     └────────┬─────────┘   decrypted     └───────────┘
-                                   frames           JSON                   │                            (on host)
-                                                                           │ HTTP POST from Docker
-                                                                           │ to host.docker.internal:19090
-                                                                     ┌─────┴──────┐
-                                                                     │ host-      │
-                                                                     │ listener   │
-                                                                     │ (:19090)   │
-                                                                     └────┬───────┘
-                                                                          │
-                                                                     ┌────┴─────────────────────────────────┐
-                                                                     │  MessageStore  (in-memory + files)    │
-                                                                     │  ┌──────────┐  ┌───────────────────┐  │
-                                                                     │  │ pending  │  │ replies           │  │
-                                                                     │  │ by_robot │  │ by_robot (queue)  │  │
-                                                                     │  └──────────┘  └───────────────────┘  │
-                                                                     │  - threading.Condition (no polling)    │
-                                                                     │  - Background cleanup (TTL: 5 min)     │
-                                                                     └────────────────────────────────────────┘
-                                                                          │
-                                                                     ┌────┴───────┐
-                                                                     │agent-poller│ ←── Agent reads/writes
-                                                                     │auto-respond│     via CLI
-                                                                     └────────────┘
+┌──────────────┐   AES-256-GCM    ┌─────────────────┐   HTTP SSE      ┌───────────┐
+│  PWA / App   │                  │                 │  (streaming)    │           │
+│  (Browser)   │──ws:/v1/chat/ui──▶  ESP32 Robot    │                 │           │
+└──────────────┘                  │  (firmware)     │                 │  OpenClaw │
+                                  │                 │◀────────────────│  Agent    │
+                                  │  persistent WS  │                 │           │
+                                  │  /v1/chat/      │                 │           │
+                                  │  ingress        │                 │           │
+                                  └────────┬────────┘                 └───────────┘
+                                           │
+                                   AES-256-GCM
+                                   binary frames
+                                           │
+                                  ┌────────▼────────┐   HTTP POST    ┌──────────────────┐
+                                  │  core_gateway    │ ─────────────▶│ openclaw-bridge   │
+                                  │  (:8080)         │                │  (:9090)          │
+                                  │                  │◀──────────────│  (stateless proxy) │
+                                  │  FastAPI +       │   reply JSON   │                   │
+                                  │  PostgreSQL +    │                └────────┬──────────┘
+                                  │  GCS emulation   │                         │
+                                  └────────┬─────────┘                  HTTP POST to
+                                           │                         host.docker.internal
+                                           │                              :19090
+                                  ┌────────▼─────────┐
+                                  │  host-listener    │
+                                  │  (:19090)         │
+                                  │  MessageStore     │
+                                  │  (in-mem + file)  │
+                                  └────────┬──────────┘
+                                           │
+                                  ┌────────▼─────────┐
+                                  │  robot-responder  │  ←── Polls pending messages
+                                  │  (auto-responder) │      Sends to OpenClaw Gateway
+                                  └───────────────────┘      for LLM processing
+                                           │
+                                  ┌────────▼─────────┐
+                                  │  agent-poller.py  │  ←── Manual CLI for debugging
+                                  └───────────────────┘
 ```
 
 ### Components
 
-- **core_gateway** (Docker): FastAPI WebSocket server. Receives encrypted binary frames from MPX robot hardware, decrypts them with AES-256-GCM, and forwards the decoded JSON to the cognitive agent via HTTP POST. On robot reconnect, proactively checks for queued replies from the host-listener.
+| Component | Where | Role |
+|-----------|-------|------|
+| **core_gateway** | Docker | FastAPI server — WebSocket ingress, REST API, marketplace, WASM deploy, JWT auth, PostgreSQL + GCS |
+| **openclaw-bridge** | Docker | Stateless HTTP relay between core_gateway and host-listener |
+| **host-listener** | Host | Message queue server with `threading.Condition`, file persistence, per-robot reply queuing |
+| **robot-responder** | Host | Auto-responder: polls host-listener, sends to OpenClaw Gateway, posts replies back |
+| **agent-poller.py** | Host | CLI tool for manually checking pending messages and submitting replies |
+| **mpx-wasm-deploy.py** | Host | CLI tool to deploy WASM skills to robots (list, download, encrypt, push) |
 
-- **openclaw-bridge** (Docker): Stateless HTTP proxy. Receives decrypted chat messages from core_gateway and forwards them to the configured cognitive agent URL. Also provides `GET /v1/replies/<robot_uuid>` to proxy reply-queue checks from core_gateway to the host-listener. Configurable via `COGNITIVE_AGENT_URL`.
-
-- **host-listener** (runs on host): Message queue server that accepts requests from the Docker bridge. Implements a proper queue system with:
-  - **Thread-safe in-memory MessageStore** with O(1) lookups
-  - **Efficient condition-based waiting** (`threading.Condition`) — no busy-polling
-  - **File-backed persistence** for durability across restarts
-  - **Automatic message expiry** (configurable TTL, default 5 min) with background cleanup
-  - **Per-robot reply queue** — if the robot disconnects before the agent replies, the reply is queued by `robot_uuid` and delivered on reconnect
-
-- **agent-poller.py**: CLI tool for the agent to check pending messages and submit replies (includes `X-Robot-UUID` header for queue support).
-
-## Queue System
-
-### Message Flow
-
-```
-Robot sends message:
-  core_gateway ──POST──→ openclaw-bridge ──POST──→ host-listener
-                                                      │
-                                                      ├── store_pending() → memory + file
-                                                      ├── wait_for_reply() → threading.Condition
-                                                      │      │
-                                  Agent replies ◄─────┘      │
-                                                      │
-                                                      ├── store_reply() → notify waiter
-                                                      ├── reply returned to bridge → gateway → robot
-                                                      └── if robot disconnected: queue by robot_uuid
-```
-
-### Key Improvements over Original
-
-| Feature | Original | New |
-|---------|----------|-----|
-| Wait mechanism | `time.sleep(1)` busy-polling | `threading.Condition.wait()` — zero CPU while waiting |
-| Message storage | File I/O only (slow) | In-memory `dict` + file persistence |
-| Lookup speed | O(n) file scan | O(1) dict lookup |
-| Message expiry | None — stale messages accumulated | TTL-based (5 min default) + background cleanup |
-| Thread safety | Implicit (GIL only) | Explicit `threading.Lock` |
-| Robot reconnect | Manual polling only | Proactive delivery via `check_queued_reply()` |
-| Reply queue | File-based, consumed on demand | In-memory + file, consumed atomically |
-
-### Message TTL
-
-Messages expire after `MESSAGE_TTL_SEC` (default: 300 seconds / 5 minutes). A background cleanup thread runs every 60 seconds to remove expired messages and orphaned reply files. Expired messages are lazily removed from `list_pending()` results as well.
-
-## Setup
-
-### 1. Prerequisites
-
-- Docker and docker-compose
-- Python 3.10+
-- OpenClaw running (port 18789)
-
-### 2. Configure
-
-```bash
-cp .env.example .env
-# Edit .env if needed
-```
-
-### 3. Start the host listener
-
-```bash
-# Manual (for testing)
-python3 host-listener.py --port 19090 --data-dir /tmp/mpx-bridge-data
-
-# Or install as systemd service
-sudo cp mpx-host-listener.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now mpx-host-listener
-```
-
-### 4. Start the Docker stack
-
-```bash
-docker compose up --build -d
-```
-
-### 5. Agent integration
-
-When the robot sends a message through the gateway:
-
-1. The message flows: robot → core_gateway → openclaw-bridge → host-listener
-2. The message is stored in the MessageStore (memory + file)
-3. The host-listener blocks efficiently using `threading.Condition`, waiting for a reply
-4. The agent (you) polls for messages and submits a reply
-5. The reply is stored, the waiter is notified, and the reply flows back to the robot
-6. If the robot disconnected, the reply is queued by `robot_uuid` and delivered on reconnect
-
-```bash
-# From the agent session, check for pending messages
-python3 /home/mangdang/mpx-server/agent-poller.py check
-
-# Submit a reply (automatically sets X-Robot-UUID for queue support)
-python3 /home/mangdang/mpx-server/agent-poller.py reply <msg_id> '{"text":"Hello!","actions":[{"gait":"wag","param":1}]}'
-```
-
-## Protocol
+## Protocol (v2.0)
 
 ### Frame format (wire)
 
@@ -143,41 +64,177 @@ Each WebSocket frame: `[16B robot_uuid][12B IV][ciphertext][16B auth_tag]`
 
 Encrypted with AES-256-GCM. Robot UUID is used as AAD.
 
-### Upstream (robot → server)
+### Upstream — robot → server
 
 ```json
-{"type": "user_chat_input", "text": "move forward"}
-{"type": "session_reset", "ts": 1234567890}
+{"type": "user_chat_input", "text": "move forward", "session_id": "<uuid>", "ts": 1700000000}
+{"type": "session_reset", "session_id": "<uuid>", "ts": 1700000000}
 ```
 
-### Downstream (server → robot)
+### Downstream — server → robot (streaming)
 
 ```json
-{
-  "type": "chat_reply",
-  "text": "Walking forward!",
-  "actions": [{"gait": "walk", "param": 1}],
-  "commands": [{"type": "lua", "script": "move(10)"}]
-}
+{"type": "step", "seq": 1, "total": 3, "text": "Thinking…", "ts": 1700000001}
+{"type": "step", "seq": 2, "total": 3, "text": "Planning…", "ts": 1700000002}
+{"type": "chat_reply", "text": "Walking forward!", "commands": [{"type": "lua", "script": "robot.gait('advance')"}], "ts": 1700000003}
 ```
 
-### REST API (host-listener)
+The gateway streams intermediate `step` frames followed by one final `chat_reply`. Downstream messages only use **Lua commands** (no legacy `actions` array).
+
+## REST API
+
+### core_gateway (:8080)
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `POST` | `/v1/chat/process` | Receive message from bridge, block for reply |
+| `GET` | `/healthz` | Health check |
+| `POST` | `/v1/auth/signup` | Register developer account |
+| `POST` | `/v1/auth/login` | Login → JWT token |
+| `POST` | `/v1/publish` | Publish a skill (WASM/AWA) to marketplace |
+| `GET` | `/v1/skills` | List all marketplace skills |
+| `GET` | `/v1/skills/{id}` | Get skill details |
+| `GET` | `/v1/skills/{id}/versions` | List versions of a skill |
+| `GET` | `/v1/skills/{id}/manifest` | Get skill manifest JSON |
+| `GET` | `/v1/skills/check?slug=` | Check if slug is available |
+| `POST` | `/v1/robots` | Register a new robot |
+| `GET` | `/v1/robots` | List all robots |
+| `GET` | `/v1/robots/{uuid}` | Get robot info |
+| `POST` | `/v1/robots/{uuid}/deploy` | Deploy WASM skills to robot (REST) |
+| `WS` | `/v1/chat/ingress` | Encrypted robot WebSocket |
+| `WS` | `/` | Same as above (default ESP32 path) |
+
+### openclaw-bridge (:9090)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/chat/process` | Forward decrypted message to host-listener |
+| `GET` | `/v1/replies/{robot_uuid}` | Proxy reply-queue check |
+| `GET` | `/v1/pending/{robot_uuid}` | Check for queued reply on reconnect |
+| `GET` | `/healthz` | Health check |
+
+### host-listener (:19090)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/chat/process` | Store message, wait for reply (Condition-based) |
 | `GET` | `/v1/messages/pending` | List all pending messages |
-| `POST` | `/v1/messages/<msg_id>/reply` | Submit a reply for a pending message |
-| `GET` | `/v1/replies/<robot_uuid>` | Consume queued reply for a robot (pop) |
+| `POST` | `/v1/messages/{msg_id}/reply` | Submit a reply |
+| `GET` | `/v1/replies/{robot_uuid}` | Consume queued reply (pop) |
 | `GET` | `/healthz` | Health check with pending count |
 
-### REST API (openclaw-bridge)
+## Queue System
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/v1/chat/process` | Forward message to host-listener, return reply |
-| `GET` | `/v1/replies/<robot_uuid>` | Proxy reply-queue check to host-listener |
-| `GET` | `/healthz` | Health check (optional agent probe) |
+### Message Flow
+
+```
+Robot → core_gateway (WS) → openclaw-bridge (HTTP) → host-listener
+  ├─ store_pending() → memory + file
+  ├─ wait_for_reply() → threading.Condition (no polling)
+  ├─ robot-responder polls → sends to OpenClaw Gateway → gets LLM reply
+  ├─ store_reply() → notify waiter → reply flows back through bridge → gateway → robot
+  └─ if robot disconnected: reply queued by robot_uuid for reconnect delivery
+```
+
+### Key Features
+
+| Feature | Implementation |
+|---------|---------------|
+| Wait mechanism | `threading.Condition.wait()` — zero CPU while waiting |
+| Message storage | In-memory `dict` + file persistence |
+| Lookup speed | O(1) dict lookup |
+| Message expiry | TTL-based (default 5 min) + background cleanup every 60s |
+| Thread safety | Explicit `threading.Lock` |
+| Robot reconnect | Proactive queued-reply delivery via `_check_pending_reply()` |
+| Per-session context | `session_id` scopes conversation history in OpenClaw |
+
+## Marketplace
+
+The core gateway includes a developer marketplace for WASM and AWA (Agentic Web Action) skills:
+
+- **Publish**: `POST /v1/publish` with JWT auth → uploads to GCS + records in PostgreSQL
+- **Discover**: `GET /v1/skills` — browse all published skills
+- **Deploy**: `POST /v1/robots/{uuid}/deploy` — sends encrypted WASM + Lua commands to robot
+- **CLI**: `mpx-wasm-deploy.py` for listing, downloading, encrypting, and pushing skills
+
+### WASM Encryption
+
+Deployed WASM binaries are encrypted per-robot using AES-256-GCM key wrapping:
+
+```
+robot_root_key ──(wrap)──→ per_skill_key ──(encrypt)──→ WASM binary
+```
+
+The encrypted blob uses the **MPXE** container format (magic `MPXE`, version `0x01`) for LittleFS storage on the robot.
+
+## Setup
+
+### 1. Prerequisites
+
+- Docker and docker-compose
+- Python 3.12+
+- PostgreSQL (Cloud SQL emulation on port 5432)
+- GCS emulator (on port 4443)
+- OpenClaw running (port 18789)
+
+### 2. Configure
+
+```bash
+cp .env.example .env
+# Edit .env if needed (keys, DB creds, URLs)
+```
+
+### 3. Start the host listener
+
+```bash
+python3 host-listener.py --port 19090 --data-dir /tmp/mpx-bridge-data
+```
+
+### 4. Start the robot auto-responder
+
+```bash
+python3 robot-responder.py
+```
+
+Or install as systemd services:
+
+```bash
+sudo cp mpx-host-listener.service /etc/systemd/system/
+sudo cp mpx-robot-responder.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now mpx-host-listener mpx-robot-responder
+```
+
+### 5. Start the Docker stack
+
+```bash
+docker compose up --build -d
+```
+
+### 6. Agent integration (manual)
+
+```bash
+# Check pending messages
+python3 agent-poller.py check
+
+# Reply with Lua commands
+python3 agent-poller.py reply <msg_id> '{"text":"Hello!","commands":[{"type":"lua","script":"robot.gait(\"twerk\")"}]}'
+```
+
+### 7. WASM skill deployment
+
+```bash
+# List WASM skills assigned to a robot
+python3 mpx-wasm-deploy.py list MPX-DOG-01
+
+# Download artifacts locally
+python3 mpx-wasm-deploy.py download MPX-DOG-01
+
+# Push to robot (encrypted, via host-listener bridge)
+python3 mpx-wasm-deploy.py push MPX-DOG-01
+
+# Push unencrypted (development)
+python3 mpx-wasm-deploy.py push MPX-DOG-01 --plain
+```
 
 ## Development
 
@@ -185,11 +242,51 @@ Encrypted with AES-256-GCM. Robot UUID is used as AAD.
 # Build and run everything
 docker compose up --build
 
-# Run just the gateway outside Docker (for debugging)
+# Run gateway outside Docker
 cd core_gateway && pip install -r requirements.txt
 OPENCLAW_BASE_URL=http://localhost:9090 uvicorn main:app --port 8080
 
-# Run just the bridge outside Docker
+# Run bridge outside Docker
 cd openclaw-bridge && pip install -r requirements.txt
 COGNITIVE_AGENT_URL=http://localhost:19090/v1/chat/process uvicorn main:app --port 9090
 ```
+
+## Project Structure
+
+```
+.
+├── docker-compose.yml              # Docker stack orchestration
+├── core_gateway/                   # Main ingress gateway (Docker)
+│   ├── main.py                     # FastAPI app: WS ingress, REST API, marketplace, auth
+│   ├── config.py                   # Configuration dataclasses
+│   ├── crypto.py                   # AES-256-GCM encrypt/decrypt + key store
+│   ├── openclaw.py                 # OpenClaw HTTP client (streaming SSE)
+│   ├── robots.py                   # Robot registration & management endpoints
+│   ├── protocol/packets.py         # Pydantic models for wire protocol
+│   ├── entrypoint.sh               # Container entrypoint
+│   ├── requirements.txt
+│   └── Dockerfile
+├── openclaw-bridge/                # Stateless HTTP relay (Docker)
+│   ├── main.py                     # FastAPI proxy with correlation IDs
+│   ├── requirements.txt
+│   └── Dockerfile
+├── host-listener.py                # Message queue server (runs on host)
+├── robot-responder.py              # Auto-responder: polls queue → OpenClaw Gateway
+├── agent-poller.py                 # CLI for manual message check/reply
+├── mpx-wasm-deploy.py              # WASM skill deployer CLI
+├── mpx-host-listener.service       # systemd unit
+├── mpx-robot-responder.service     # systemd unit
+├── chat-ingress-spec.md            # Wire protocol specification (v2.0)
+├── lua-bindings.md                 # Lua robot API reference
+└── README.md
+```
+
+## Dependencies
+
+- **FastAPI** + **Uvicorn** — async web framework
+- **Cryptography** — AES-256-GCM
+- **HTTPX** — async HTTP client with SSE streaming
+- **asyncpg** — PostgreSQL driver
+- **google-cloud-storage** — GCS emulation client
+- **PyJWT** — JWT authentication
+- **Pydantic** — data validation
