@@ -340,6 +340,101 @@ async def lua_output(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# WASM Deploy — queue Lua commands to host-listener
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/deploy/queue")
+async def deploy_queue(request: Request):
+    """Queue WASM deploy Lua commands for a robot via the host-listener.
+
+    Called by core_gateway after it downloads WASM from GCS. This endpoint
+    proxies the deploy commands to the host-listener's reply queue so they
+    get delivered to the robot on its next WebSocket poll.
+
+    Request body::
+        {
+          "robot_uuid": "MPX-DOG-01",
+          "reply": {
+            "type": "chat_reply",
+            "text": "Deploying WASM skills...",
+            "commands": [
+              {"type": "lua", "script": "fs.write(...)"},
+              ...
+            ]
+          }
+        }
+
+    Returns::
+        {"status": "queued"} with 201 on success,
+        or error details on failure.
+    """
+    cid = _set_cid(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+
+    robot_uuid = body.get("robot_uuid", "")
+    reply = body.get("reply", {})
+
+    if not robot_uuid:
+        return JSONResponse(status_code=422, content={"error": "robot_uuid required"})
+    if not isinstance(reply, dict) or "commands" not in reply:
+        return JSONResponse(status_code=422, content={"error": "reply with commands[] required"})
+
+    # Ensure type and timestamp
+    reply.setdefault("type", "chat_reply")
+    reply["ts"] = int(time.time())
+
+    # Proxy to host-listener's reply endpoint
+    import uuid as _uuid
+    msg_id = f"deploy-{_uuid.uuid4().hex[:12]}"
+    agent_base = COGNITIVE_AGENT_URL.rstrip("/v1/chat/process").rstrip("/")
+    reply_url = f"{agent_base}/v1/messages/{msg_id}/reply"
+
+    client = await get_client()
+    try:
+        resp = await client.post(
+            reply_url,
+            json=reply,
+            headers={
+                "X-Robot-UUID": robot_uuid,
+                "X-Correlation-ID": cid,
+            },
+            timeout=httpx.Timeout(10.0, connect=5.0, read=10.0, write=10.0),
+        )
+        if resp.status_code in (200, 201):
+            logger.info(
+                "Deploy queued for %s: %d commands, msg_id=%s",
+                robot_uuid,
+                len(reply.get("commands", [])),
+                msg_id,
+            )
+            return JSONResponse(
+                status_code=201,
+                content={"status": "queued", "msg_id": msg_id, "robot_uuid": robot_uuid},
+            )
+        else:
+            logger.warning(
+                "Host-listener returned HTTP %d for deploy queue: %.200s",
+                resp.status_code,
+                resp.text[:200],
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"host-listener returned {resp.status_code}"},
+            )
+    except httpx.RequestError as exc:
+        logger.warning("Failed to queue deploy for %s: %s", robot_uuid, exc)
+        return JSONResponse(
+            status_code=502,
+            content={"error": "host-listener unreachable"},
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main process endpoint
 # ---------------------------------------------------------------------------
 

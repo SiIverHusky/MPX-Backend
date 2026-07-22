@@ -8,6 +8,11 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from protocol.packets import HEADER_SIZE, TAG_SIZE
 
+# ── MPXE WASM encryption constants ──────────────────────────────────────
+
+MPXE_MAGIC = b"MPXE"
+MPXE_VERSION = 0x01
+
 logger = logging.getLogger("core_gateway.crypto")
 
 
@@ -246,3 +251,57 @@ def build_downstream_frame_with_iv(
     tag = ct_and_tag[-16:]
 
     return robot_uuid + iv + ct + tag
+
+
+# ---------------------------------------------------------------------------
+# MPXE WASM skill encryption (design doc: docs/wasm-encryption-design.md)
+# ---------------------------------------------------------------------------
+
+def encrypt_wasm_for_robot(
+    robot_uuid: str,
+    robot_key: bytes,
+    skill_id: str,
+    wasm_bytes: bytes,
+) -> bytes:
+    """Encrypt a WASM binary for a specific robot using two-layer key wrapping.
+
+    Key hierarchy:
+      robot_root_key ──(GCM-wrap)──→ per_skill_key ──(GCM-encrypt)──→ WASM
+
+    The per-skill key is generated fresh, used once, and discarded.
+
+    Returns a single MPXE-format blob ready for LittleFS
+    (docs/wasm-encryption-design.md §4.1).
+    """
+    import hashlib
+
+    # 1. Generate random per-skill key
+    skill_key = os.urandom(32)
+
+    # 2. Wrap skill key with robot's root key
+    wrap_iv = os.urandom(12)
+    aesgcm = AESGCM(robot_key)
+    wrap_aad = f"wasm-wrap:v1:{robot_uuid}".encode("utf-8")
+    wrapped_key_ct = aesgcm.encrypt(wrap_iv, skill_key, wrap_aad)
+
+    # 3. Hash skill_id for fixed-width AAD
+    skill_id_hash = hashlib.sha256(skill_id.encode("utf-8")).digest()[:8]
+
+    # 4. Encrypt WASM with skill key
+    wasm_iv = os.urandom(12)
+    aesgcm_wasm = AESGCM(skill_key)
+    wasm_aad = f"wasm-skill:v1:{skill_id_hash.hex()}".encode("utf-8")
+    wasm_ct_and_tag = aesgcm_wasm.encrypt(wasm_iv, wasm_bytes, wasm_aad)
+
+    # 5. Build single MPXE blob
+    blob = bytearray()
+    blob.extend(MPXE_MAGIC)           # [4]  magic
+    blob.append(MPXE_VERSION)         # [1]  version
+    blob.extend(wrap_iv)              # [12] wrap_iv
+    blob.extend(wrapped_key_ct)       # [48] wrapped key (32 ct + 16 tag)
+    blob.append(0x00)                 # [1]  key_algo (reserved)
+    blob.extend(skill_id_hash)        # [8]  skill_id hash
+    blob.extend(wasm_iv)              # [12] wasm_iv
+    blob.extend(wasm_ct_and_tag)      # [N+16] ciphertext + tag
+
+    return bytes(blob)

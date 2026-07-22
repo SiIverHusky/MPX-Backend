@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from google.cloud import storage as gcs_storage
 
 from config import db_settings, storage_settings
-from crypto import build_downstream_frame, build_downstream_frame_with_iv, decrypt_frame, load_keys_from_db, lookup_key_by_uuid
+from crypto import build_downstream_frame, build_downstream_frame_with_iv, decrypt_frame, load_keys_from_db, lookup_key_by_uuid, encrypt_wasm_for_robot
 from robots import router as robots_router, init as init_robots
 from openclaw import openclaw_process, openclaw_process_stream, send_lua_output, shutdown_client
 
@@ -543,6 +543,213 @@ async def publish_skill(request: Request) -> JSONResponse:
         "skill_id": skill_id,
         "version": version,
         "path": artifact_path,
+    })
+
+
+# ===========================================================================
+# WASM Deploy — Download skills from GCS and push to robot
+# ===========================================================================
+
+
+@app.post("/v1/robots/{robot_uuid}/deploy")
+async def deploy_wasm_skills(robot_uuid: str, request: Request) -> JSONResponse:
+    """Download enabled WASM skills from GCS and return the data + Lua
+    commands directly in the HTTP response for the robot firmware to execute.
+
+    The robot calls this via its marketplace_proxy HTTP client (not WebSocket),
+    so the WASM binary and deploy commands are returned inline — no queue needed.
+
+    Request body (optional)::
+        {"skill_id": "haris_dev~backflipping"}   # deploy just this skill
+        {}                                         # deploy all enabled WASM skills
+        {"encrypted": false}                      # deploy unencrypted (dev robots)
+
+    Returns::
+        {
+          "status": "success",
+          "robot_uuid": "MPX-DOG-01",
+          "encrypted": true,                        # whether encryption was applied
+          "skills": [{
+            "skill_id": "...",
+            "version": "1.0.0",
+            "slug": "backflipping",
+            "robot_path": "/backflipping.wasm",
+            "size_bytes": 20045,
+            "wasm_base64": "<base64-encoded binary>",
+            "encrypted": true,                      # per-skill encryption flag
+            "commands": [{"type": "lua", "script": "..."}, ...]
+          }]
+        }
+    """
+    # ── Parse optional body ────────────────────────────────────
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    filter_skill_id = body.get("skill_id", "").strip()
+    encrypted = body.get("encrypted", True)  # default: encrypted
+
+    # ── Query DB for robot + AES key + enabled WASM skills ─────
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        robot = await conn.fetchrow(
+            "SELECT robot_uuid, aes_key_hex FROM robots WHERE robot_uuid = $1", robot_uuid,
+        )
+        if robot is None:
+            return JSONResponse(status_code=404, content={"error": "robot not found"})
+
+        robot_key_hex = robot["aes_key_hex"]
+
+        if filter_skill_id:
+            rows = await conn.fetch(
+                """SELECT ms.id, ms.title, ms.current_version,
+                          sv.gcs_artifact_path as version_artifact_path
+                   FROM robot_skills rs
+                   JOIN marketplace_skills ms ON ms.id = rs.skill_id
+                   JOIN skill_versions sv ON sv.skill_id = ms.id AND sv.version = ms.current_version
+                   WHERE rs.robot_uuid = $1
+                     AND ms.skill_type = 'WASM'
+                     AND rs.enabled = true
+                     AND ms.id = $2""",
+                robot_uuid, filter_skill_id,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT ms.id, ms.title, ms.current_version,
+                          sv.gcs_artifact_path as version_artifact_path
+                   FROM robot_skills rs
+                   JOIN marketplace_skills ms ON ms.id = rs.skill_id
+                   JOIN skill_versions sv ON sv.skill_id = ms.id AND sv.version = ms.current_version
+                   WHERE rs.robot_uuid = $1
+                     AND ms.skill_type = 'WASM'
+                     AND rs.enabled = true""",
+                robot_uuid,
+            )
+
+    if not rows:
+        msg = "no enabled WASM skills" + (f" matching '{filter_skill_id}'" if filter_skill_id else "")
+        return JSONResponse(status_code=404, content={"error": msg, "robot_uuid": robot_uuid})
+
+    # ── For each skill, download from GCS and package ──────────
+    import base64 as _b64
+
+    gcs = get_gcs_client()
+    bucket = gcs.bucket(storage_settings.bucket)
+    import anyio as _anyio
+
+    deployed_skills: list[dict] = []
+
+    for row in rows:
+        skill_id = row["id"]
+        title = row["title"]
+        version = row["current_version"]
+        artifact_path = row["version_artifact_path"]
+        slug = skill_id.split("~", 1)[1] if "~" in skill_id else skill_id
+        robot_path = f"/{slug}.wasm"  # may change to .mpxe after encryption
+
+        logger.info("Deploying %s v%s from gs://%s/%s", skill_id, version, storage_settings.bucket, artifact_path)
+
+        blob = bucket.blob(artifact_path)
+        if not await _anyio.to_thread.run_sync(blob.exists):
+            logger.warning("Artifact not found at %s — skipping %s", artifact_path, skill_id)
+            deployed_skills.append({
+                "skill_id": skill_id,
+                "slug": slug,
+                "version": version,
+                "status": "skipped",
+                "error": "artifact not found in GCS",
+            })
+            continue
+
+        wasm_data = await _anyio.to_thread.run_sync(blob.download_as_bytes)
+
+        # ── Encrypt if requested ─────────────────────────────────────
+        skill_encrypted = encrypted
+        if skill_encrypted:
+            if not robot_key_hex or len(robot_key_hex) != 64:
+                logger.warning(
+                    "Robot %s has no valid AES key — falling back to plain deploy",
+                    robot_uuid,
+                )
+                skill_encrypted = False
+            else:
+                robot_key = bytes.fromhex(robot_key_hex)
+                wasm_data = encrypt_wasm_for_robot(
+                    robot_uuid, robot_key, skill_id, wasm_data,
+                )
+                logger.info(
+                    "Encrypted %s → %d bytes MPXE blob",
+                    artifact_path, len(wasm_data),
+                )
+                robot_path = f"/{slug}.mpxe"  # encrypted extension
+
+
+        # Pad to multiple of 3 so base64 has NO = padding
+        # The robot's crypto.base64_decode() appears to have an off-by-one
+        # with = padding — pad + strip approach avoids this entirely.
+        pad_len = (3 - len(wasm_data) % 3) % 3
+        if pad_len:
+            wasm_padded = wasm_data + b"\x00" * pad_len
+        else:
+            wasm_padded = wasm_data
+        wasm_b64 = _b64.b64encode(wasm_padded).decode("ascii")
+        logger.info(
+            "Downloaded %s (%d bytes → %d base64, padded %d→%d)",
+            artifact_path, len(wasm_data), len(wasm_b64),
+            len(wasm_data), len(wasm_padded),
+        )
+
+        # Verify no ]] in base64 (would break Lua [[ long string ]]
+        assert "]" not in wasm_b64, f"base64 contains ]] at unexpected position"
+
+        # Lightweight Lua commands: write the base64 WASM to LittleFS
+        # The robot firmware receives these and executes them locally
+        #
+        # Strategy: embed full base64 in a Lua [[ long-string ]],
+        # pad-strip trailing null, write to LittleFS, then run.
+        commands = [
+            {
+                "type": "lua",
+                "script": "local i = fs.info(); print('FS: ' .. i.used .. '/' .. i.total)",
+            },
+            {
+                "type": "lua",
+                "script": f"""\
+do
+  local b64 = [[{wasm_b64}]]
+  local raw = crypto.base64_decode(b64)
+  -- strip trailing null padding byte (added to avoid base64 =)
+  local sz = #raw
+  if sz > 0 and raw:byte(sz) == 0 then raw = raw:sub(1, sz - 1) end
+  local ok = fs.write("{robot_path}", raw)
+  print("write=" .. tostring(ok) .. " size=" .. #raw)
+end""".strip(),
+            },
+            {
+                "type": "lua",
+                "script": f"if fs.exists('{robot_path}') then print('✓ {slug} deployed ({len(wasm_data)}b)'); wasm.run('{robot_path}', 'on_start') else print('✗ deploy failed') end",
+            },
+        ]
+
+        deployed_skills.append({
+            "skill_id": skill_id,
+            "title": title,
+            "slug": slug,
+            "version": version,
+            "status": "ready",
+            "size_bytes": len(wasm_data),
+            "robot_path": robot_path,
+            "wasm_base64": wasm_b64,
+            "commands": commands,
+            "encrypted": skill_encrypted,
+        })
+
+    return JSONResponse(content={
+        "status": "success",
+        "robot_uuid": robot_uuid,
+        "encrypted": encrypted,
+        "skill_count": len(deployed_skills),
+        "skills": deployed_skills,
     })
 
 
